@@ -26,6 +26,8 @@ Panel {
   property var effects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   property int intensity: 5
   property int introSize: 2
+  property bool bootBetween: true
+  property int rotateSecs: 20
   property string byline: ""
   property string label: "♪"
 
@@ -42,6 +44,8 @@ Panel {
   function setRunning(v)   { root.running = v;   write("running="   + (v ? "1" : "0")); }
   function setAudio(v)     { root.audio = v;     write("audio="     + (v ? "1" : "0")); }
   function setShowFps(v)   { root.showFps = v;   write("show_fps="  + (v ? "1" : "0")); }
+  function setBootBetween(v) { root.bootBetween = v; write("boot_between=" + (v ? "1" : "0")); }
+  function setRotateSecs(v) { root.rotateSecs = v;  write("rotate_secs=" + v); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
   function setIntroSize(v) {
@@ -86,6 +90,8 @@ Panel {
           if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.intensity === "number") root.intensity = s.intensity
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
+          if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
+          if (typeof s.rotate_secs === "number") root.rotateSecs = s.rotate_secs
           if (typeof s.byline === "string")   root.byline = s.byline
         } catch (e) {}
       }
@@ -178,7 +184,7 @@ Panel {
 
         PanelSectionHeader { text: "BACKGROUNDS" }
 
-        // Enabled set with per-effect toggle; >1 enabled => rotates every 20s.
+        // Enabled set with per-effect toggle; >1 enabled => rotates (see ROTATION).
         Repeater {
           model: root.allEffects
           RowLayout {
@@ -196,6 +202,33 @@ Panel {
               onToggled: root.toggleEffect(modelData, !(root.effects.indexOf(modelData) >= 0))
             }
           }
+        }
+
+        PanelSectionHeader { text: "ROTATION" }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(10)
+          Text {
+            text: "Boot between backgrounds"
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : "sans"
+            font.pixelSize: Style.font.body
+            Layout.fillWidth: true
+          }
+          ToggleSwitch {
+            checked: root.bootBetween
+            onToggled: root.setBootBetween(!root.bootBetween)
+          }
+        }
+
+        PanelSectionHeader { text: "SECONDS PER BACKGROUND" }
+        PanelSlider {
+          Layout.fillWidth: true
+          bar: root.bar
+          minimum: 3; maximum: 120; step: 1; integer: true
+          value: root.rotateSecs
+          onMoved: function(v) { root.setRotateSecs(v) }
         }
 
         PanelSectionHeader { text: "INTENSITY" }
@@ -220,7 +253,7 @@ Panel {
         TextField {
           Layout.fillWidth: true
           // Default signature; emptying the field reverts to it.
-          property string defaultByline: "By x.com/@avillagran"
+          property string defaultByline: "By x.com/avillagran"
           text: root.byline.trim() === "" ? defaultByline : root.byline
           placeholderText: defaultByline
           onEditingFinished: {

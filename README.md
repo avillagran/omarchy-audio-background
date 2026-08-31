@@ -55,19 +55,25 @@ brightness follows band energy smoothly.
 {
   "running": true, "audio": true, "effect": "matrix",
   "effects": ["matrix","rain","wave","bars","donut","fire","starfield","life"],
-  "intensity": 5, "byline": "", "restart": 0, "intro_size": 2
+  "intensity": 5, "byline": "", "restart": 0, "intro_size": 2,
+  "boot_between": true, "rotate_secs": 20
 }
 ```
 
 - `running` — background on/off.
 - `audio` — react to system audio on/off.
 - `effect` — active effect (used when only one is enabled).
-- `effects` — enabled set; >1 rotates every 20 s.
+- `effects` — enabled set; >1 rotates.
 - `intensity` — 0–10, animation speed / trail length.
-- `byline` — intro signature text; empty = default `By x.com/@avillagran`.
+- `byline` — intro signature text; empty = default `By x.com/avillagran`.
 - `restart` — counter; bump to replay the intro (bar-widget right-click).
-- `intro_size` — 1–3, intro title scale (default 2). The title renders as ASCII art
-  (a 5-row bitmap font, each pixel scaled ×N), centered horizontally and vertically.
+- `intro_size` — 1–3, intro title scale (default 2). The whole boot splash (title,
+  byline and effect tag) renders as ASCII art, centered horizontally and vertically.
+- `boot_between` — show the boot splash when ROTATING between backgrounds (default
+  true). A manual restart (right-click) always shows it. Applies on the next rotation
+  without respawning.
+- `rotate_secs` — seconds each background stays before rotating to the next (3–3600,
+  default 20). Live-configurable; takes effect on the next rotation tick.
 
 ## Control from the bar
 

@@ -9,6 +9,8 @@
 #   write_state.sh intensity=0..10
 #   write_state.sh intro_size=1..3      (intro title ASCII-art scale, default 2)
 #   write_state.sh show_fps=1|0         (FPS counter overlay)
+#   write_state.sh boot_between=1|0     (show boot splash when rotating backgrounds)
+#   write_state.sh rotate_secs=N        (seconds each background stays before rotating)
 #   write_state.sh byline=Some text     (intro byline; empty = default)
 #   write_state.sh restart              (bump restart counter -> replay intro)
 set -e
@@ -17,6 +19,7 @@ mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)
 running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="2"; show_fps="false"
+boot_between="true"; rotate_secs="20"
 effects="matrix rain wave bars donut fire starfield life"
 
 if [ -f "$STATE" ]; then
@@ -26,10 +29,12 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"running"[^,}]*' "$STATE" || true);   [ -n "$v" ] && running=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"audio"[^,}]*' "$STATE" || true);     [ -n "$v" ] && audio=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"show_fps"[^,}]*' "$STATE" || true);  [ -n "$v" ] && show_fps=$(echo "$v" | grep -o '\(true\|false\)')
+  v=$(grep -o '"boot_between"[^,}]*' "$STATE" || true); [ -n "$v" ] && boot_between=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"effect"[^,}]*' "$STATE" || true);    [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
   v=$(grep -o '"intensity"[^,}]*' "$STATE" || true); [ -n "$v" ] && intensity=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"restart"[^,}]*' "$STATE" || true);   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"intro_size"[^,}]*' "$STATE" || true); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]\+')
+  v=$(grep -o '"rotate_secs"[^,}]*' "$STATE" || true); [ -n "$v" ] && rotate_secs=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"byline"[^,}]*' "$STATE" || true);    [ -n "$v" ] && byline=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
   v=$(grep -o '"effects"[^]]*\]' "$STATE" || true);  [ -n "$v" ] && effects=$(echo "$v" | sed 's/^"effects"\s*:\s*\[//; s/\]$//' | grep -o '"[a-z]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')
 fi
@@ -39,8 +44,10 @@ case "$arg" in
   running=*)  running=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   audio=*)    audio=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   show_fps=*) show_fps=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
+  boot_between=*) boot_between=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   intensity=*) intensity="${arg#*=}" ;;
   intro_size=*) intro_size="${arg#*=}" ;;
+  rotate_secs=*) rotate_secs="${arg#*=}" ;;
   effect=*)   effect="${arg#*=}" ;;
   byline=*)   byline="${arg#*=}" ;;
   restart)    restart=$((restart + 1)) ;;
@@ -58,5 +65,5 @@ esac
 # emit JSON array for effects
 arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd, -)
 
-printf '{"running":%s,"audio":%s,"show_fps":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s}\n' \
-  "$running" "$audio" "$show_fps" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" > "$STATE"
+printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s}\n' \
+  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" > "$STATE"

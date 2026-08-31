@@ -30,8 +30,7 @@ use std::time::Duration;
 use vte4::{TerminalExt, TerminalExtManual};
 
 const DEFAULT_EFFECTS: [&str; 8] = ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"];
-const DEFAULT_BYLINE: &str = "By x.com/@avillagran";
-const ROTATE_SECS: u64 = 20;
+const DEFAULT_BYLINE: &str = "By x.com/avillagran";
 
 #[derive(Clone, PartialEq)]
 struct Config {
@@ -44,6 +43,10 @@ struct Config {
     restart: i64,
     intro_size: i64,
     show_fps: bool,
+    // Show the boot splash when ROTATING between backgrounds (manual restart always
+    // shows it). Time each background stays on screen before rotating.
+    boot_between: bool,
+    rotate_secs: i64,
 }
 
 impl Default for Config {
@@ -58,6 +61,8 @@ impl Default for Config {
             restart: 0,
             intro_size: 2,
             show_fps: false,
+            boot_between: true,
+            rotate_secs: 20,
         }
     }
 }
@@ -85,6 +90,8 @@ fn read_config() -> Config {
     if let Some(v) = json_num(&text, "restart") { cfg.restart = v; }
     if let Some(v) = json_num(&text, "intro_size") { cfg.intro_size = v; }
     if let Some(v) = json_bool(&text, "show_fps") { cfg.show_fps = v; }
+    if let Some(v) = json_bool(&text, "boot_between") { cfg.boot_between = v; }
+    if let Some(v) = json_num(&text, "rotate_secs") { cfg.rotate_secs = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -157,7 +164,8 @@ fn main() -> Result<()> {
         let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
-        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps);
+        let show_intro = !args.iter().any(|a| a == "--no-intro");
+        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro);
     }
 
     gtk4::init()?;
@@ -173,7 +181,7 @@ fn main() -> Result<()> {
     ));
     let last_cfg: Rc<RefCell<Config>> = Rc::new(RefCell::new(cfg0));
 
-    rebuild_layers(&windows, &self_bin, &last_cfg.borrow(), &active_effect.borrow());
+    rebuild_layers(&windows, &self_bin, &last_cfg.borrow(), &active_effect.borrow(), true);
 
     // Rebuild ONLY when the monitor geometry actually changed (count + size +
     // scale). items-changed also fires on spurious signals; rebuilding on those
@@ -199,7 +207,7 @@ fn main() -> Result<()> {
                 println!("monitors changed — rebuilding background layers");
                 let cfg = read_config();
                 *lc.borrow_mut() = cfg.clone();
-                rebuild_layers(&w, &b, &cfg, &ae.borrow());
+                rebuild_layers(&w, &b, &cfg, &ae.borrow(), true);
                 *rebuilding.borrow_mut() = false;
             });
         });
@@ -222,30 +230,56 @@ fn main() -> Result<()> {
                     *ae.borrow_mut() = cfg.effect.clone();
                 }
                 *lc.borrow_mut() = cfg.clone();
-                rebuild_layers(&w, &b, &cfg, &ae.borrow());
+                // boot_between / rotate_secs are read live by the rotation timer, so a
+                // change to ONLY those shouldn't respawn the background (and replay the
+                // intro). Rebuild only when a structural/visual field actually changed.
+                let visual = cfg.running != old.running
+                    || cfg.effect != old.effect
+                    || cfg.effects != old.effects
+                    || cfg.intensity != old.intensity
+                    || cfg.audio != old.audio
+                    || cfg.byline != old.byline
+                    || cfg.restart != old.restart
+                    || cfg.intro_size != old.intro_size
+                    || cfg.show_fps != old.show_fps;
+                if visual {
+                    rebuild_layers(&w, &b, &cfg, &ae.borrow(), true);
+                }
             }
             glib::ControlFlow::Continue
         });
     }
 
-    // Rotate through the enabled effects when more than one is enabled.
+    // Rotate through the enabled effects when more than one is enabled. Fires every
+    // second and counts up to cfg.rotate_secs so the interval is live-configurable
+    // from the panel (no respawn needed to change it). Rotating respects
+    // boot_between for whether the splash replays.
     {
         let w = windows.clone();
         let b = self_bin.clone();
         let lc = last_cfg.clone();
         let ae = active_effect.clone();
-        glib::timeout_add_local(Duration::from_secs(ROTATE_SECS), move || {
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        glib::timeout_add_local(Duration::from_secs(1), move || {
             let cfg = lc.borrow().clone();
             if cfg.running && cfg.effects.len() > 1 {
-                let cur = ae.borrow().clone();
-                let next = match cfg.effects.iter().position(|e| *e == cur) {
-                    Some(i) => cfg.effects[(i + 1) % cfg.effects.len()].clone(),
-                    None => cfg.effects[0].clone(),
-                };
-                if next != cur {
-                    *ae.borrow_mut() = next.clone();
-                    rebuild_layers(&w, &b, &cfg, &next);
+                let e = elapsed.get() + 1;
+                if e >= cfg.rotate_secs.clamp(3, 3600) as u64 {
+                    elapsed.set(0);
+                    let cur = ae.borrow().clone();
+                    let next = match cfg.effects.iter().position(|x| *x == cur) {
+                        Some(i) => cfg.effects[(i + 1) % cfg.effects.len()].clone(),
+                        None => cfg.effects[0].clone(),
+                    };
+                    if next != cur {
+                        *ae.borrow_mut() = next.clone();
+                        rebuild_layers(&w, &b, &cfg, &next, cfg.boot_between);
+                    }
+                } else {
+                    elapsed.set(e);
                 }
+            } else {
+                elapsed.set(0);
             }
             glib::ControlFlow::Continue
         });
@@ -278,6 +312,7 @@ fn rebuild_layers(
     self_bin: &str,
     cfg: &Config,
     effect: &str,
+    show_intro: bool,
 ) {
     // Kill renderer subprocesses from a previous build. The pattern `--render`
     // only matches the child renderers, never this parent binary.
@@ -296,7 +331,7 @@ fn rebuild_layers(
     println!("found {n} monitor(s), running={} effect={effect}", cfg.running);
     for i in 0..n {
         if let Some(monitor) = monitors.item(i).and_downcast::<gdk::Monitor>() {
-            let w = spawn_layer_for_monitor(&monitor, self_bin, cfg, effect);
+            let w = spawn_layer_for_monitor(&monitor, self_bin, cfg, effect, show_intro);
             windows.borrow_mut().push(w);
         }
     }
@@ -307,6 +342,7 @@ fn spawn_layer_for_monitor(
     self_bin: &str,
     cfg: &Config,
     effect: &str,
+    show_intro: bool,
 ) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder()
         .title("ttfx-bg")
@@ -352,7 +388,7 @@ fn spawn_layer_for_monitor(
         let cell_aspect = if cw > 0.0 { ch / cw } else { 2.0 };
         let byline = if cfg.byline.trim().is_empty() { DEFAULT_BYLINE } else { cfg.byline.trim() }.to_string();
         let audio = if cfg.audio { "1" } else { "0" };
-        let argv: Vec<String> = vec![
+        let mut argv: Vec<String> = vec![
             self_bin.to_string(),
             "--render".into(),
             "--effect".into(), effect.to_string(),
@@ -365,6 +401,8 @@ fn spawn_layer_for_monitor(
             "--cell-aspect".into(), format!("{cell_aspect:.3}"),
             "--show-fps".into(), if cfg.show_fps { "1".into() } else { "0".into() },
         ];
+        // Rotation with "boot between backgrounds" off skips the splash.
+        if !show_intro { argv.push("--no-intro".into()); }
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         // Pre-clear so Vte doesn't flash its "N by M cells" placeholder while
         // the renderer's PTY is still connecting.
@@ -784,7 +822,7 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     thread::sleep(Duration::from_millis(2600));
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool) -> Result<()> {
+fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
     // Use the REAL PTY size, but WAIT for it to settle first: Vte spawns the pty at
@@ -818,7 +856,9 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
         _ => &["\x1b[97m", "\x1b[92m", "\x1b[32m"], // matrix
     };
 
-    show_intro(&mut scr, palette, byline, effect, intro_size);
+    if with_intro {
+        show_intro(&mut scr, palette, byline, effect, intro_size);
+    }
 
     // Each effect returns Ok(()) when it detects a PTY resize; re-dispatch so
     // it restarts with fresh state at the new size (no jump, no stale grid).
