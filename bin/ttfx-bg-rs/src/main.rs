@@ -689,7 +689,9 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     let ex = scr.cols.saturating_sub(tag.len()) / 2;
     for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + tag_off, ch, 3); }
     scr.present(palette);
-    thread::sleep(Duration::from_millis(900));
+    // Hold the finished splash long enough to actually read it — the intro is the
+    // "boot" moment, so don't flash past it (was 900ms; the big HiDPI text needs time).
+    thread::sleep(Duration::from_millis(2600));
 }
 
 fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool) -> Result<()> {

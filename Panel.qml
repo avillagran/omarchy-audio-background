@@ -44,7 +44,11 @@ Panel {
   function setShowFps(v)   { root.showFps = v;   write("show_fps="  + (v ? "1" : "0")); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
-  function setIntroSize(v) { root.introSize = v; write("intro_size=" + v); }
+  function setIntroSize(v) {
+    root.introSize = v
+    write("intro_size=" + v)
+    introReplay.restart()   // the intro renders once at startup; replay it at the new size (debounced)
+  }
   function setByline(t)    { root.byline = t;    write("byline="    + t); }
   function toggleEffect(e, on) {
     var list = root.effects.slice()
@@ -57,6 +61,15 @@ Panel {
   }
 
   Component.onCompleted: root.refresh()
+
+  // The intro (boot text) renders once at renderer startup, so a new intro_size only
+  // shows on a restart. Debounce a restart until the size slider stops moving.
+  Timer {
+    id: introReplay
+    interval: 700
+    repeat: false
+    onTriggered: root.write("restart")
+  }
 
   Process {
     id: statusProc
