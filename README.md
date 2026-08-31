@@ -1,106 +1,136 @@
 # Omarchy Audio Background
 
-Audio-reactive **animated desktop background** for Omarchy / Hyprland, controlled from the
-Omarchy bar via a Quickshell plugin. It is a **real background layer** (Wayland layer-shell),
-not a floating window: it lives *above* the wallpaper image and *below* app windows and the
-bar, so it reads as a genuine living desktop.
+Animated, audio-reactive **desktop background** for Omarchy / Hyprland, controlled from
+the Omarchy bar via a Quickshell plugin. It is a **real background layer** (Wayland
+layer-shell), not a floating window: it lives *below* app windows and the bar, so it
+reads as a genuine living desktop.
+
+> **Status: 100% Rust.** The old Python/PNG pipeline (`render_bg.py`,
+> `analyzer_daemon.py`, etc.) is gone. The background is now rendered entirely in Rust
+> (gtk4-layer-shell + Vte + a hand-rolled renderer). See **Roadmap** for the next step:
+> integrating [`ttfx`](https://github.com/omacom/ttfx) as the effects engine.
 
 ## How it works
 
-- `Service.qml` (plugin kind `service`) opens a `PanelWindow` on `WlrLayer.Bottom` with namespace
-  `omarchy-ttfx-bg`. Omarchy's own wallpaper is on `WlrLayer.Background`, so this sits just above
-  it; app windows and the bar render above it. Confirmed z-order: `Background(0) < ttfx-bg(1) < bar(2)`.
-- A `PanelWindow` child `Image` displays `~/.cache/omarchy/ttfx_bg.png`, reloaded every frame.
-- `render_bg.py` (pure python **stdlib**, no numpy/PIL) renders the current effect to that PNG at
-  low resolution (320×180) and lets the compositor scale it up. It reads the latest audio frame
-  from `/tmp/ttfx_bg_spectrum.json`, published by `analyzer_daemon.py` (Goertzel spectrum via
-  `analyzer_light.Analyzer` + `parec` on the system monitor).
-- `analyzer_daemon.py` spawns `parec`, runs the analyzer, and writes one JSON frame line per chunk
-  (~30/s) to the temp file.
+- A single Rust binary (`bin/ttfx-bg-rs`) opens **one gtk4-layer-shell window per
+  connected monitor**, each anchored to `WlrLayer.Bottom`, so the background covers
+  *every* screen (internal + external). Hyprland re-adds a monitor on a resolution
+  change, which triggers a rebuild so each layer keeps matching the new geometry.
+- Inside each layer we embed a **Vte terminal** and draw the effect directly to it.
+  (ttfx's own binary freezes inside an embedded Vte — proven — but our own renderer
+  animates fine, so we use our renderer as the continuous background.)
+- A `glib` timer polls `state.json` (written by the config panel) every 700 ms. If
+  `running` / `effect` / `intensity` changed, the layers are rebuilt and the renderer
+  subprocesses restarted with the new settings — no restart of the binary needed.
+- The renderer is launched as a child of the Vte PTY (`ttfx-bg-rs --matrix COLS ROWS
+  --effect NAME --intensity N`). Killing the parent's renderers on rebuild avoids
+  orphaned processes.
 
-### Effects (rotate automatically)
-`bars` (spectrum equalizer) → `wave` (waveform) → `radial` (radial spokes) → `rain`
-(matrix-style falling columns). Rotation is every 12 s; disable with `rotate:false` and pick one
-via `effect:"<name>"`. The visualizer is **always reactive** — an idle baseline animates even in
-silence, and real audio raises the levels on top of it.
+### Effects
 
-### Word list (config panel)
-The config file `~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json`
-holds `words` (default `["Omarchy"]`). The `rain` effect tints its columns per word. Edit the list
-to use your own words; the bar widget writes this file via `bin/set_state.py`.
+`matrix` (green, default) · `rain` (cyan) · `wave` (magenta) · `bars` (yellow).
+Each is a color scheme of the same column-rain renderer; `intensity` (0–10) scales
+speed and trail length. These are placeholders until the real `ttfx` effects land.
 
-State schema (`state.json`):
+### Configuration (`state.json`)
+
+`~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json`:
+
 ```json
-{ "running": true, "effect": "bars", "rotate": true, "words": ["Omarchy"] }
+{ "running": true, "effect": "matrix", "intensity": 5 }
 ```
-- `running` — background on/off (bar widget left-click toggles it).
-- `effect` — `"bars" | "wave" | "radial" | "rain"` (used when `rotate` is false).
-- `rotate` — auto-cycle through effects.
-- `words` — list of words feeding the text/rain effect (default `["Omarchy"]`).
+
+- `running` — background on/off (toggle in the config panel / bar widget).
+- `effect`  — `matrix` | `rain` | `wave` | `bars`.
+- `intensity` — 0–10, animation speed / trail length.
 
 ## Control from the bar
-`BarWidget.qml` (plugin kind `bar-widget`): left-click toggles `running`; right-click opens a menu
-to pick the effect or toggle rotation. It writes `state.json` via `bin/set_state.py`. The service
-polls that file every second, so changes apply within ~1 s.
 
-No heavy deps (no numpy/PIL/pygame). Only `parec` (PipeWire/Pulse) + python stdlib.
+- `BarWidget.qml` — bar icon (music-note over rectangle). Left-click opens the config
+  panel; it writes `state.json`.
+- `Panel.qml` — the configuration panel (toggle on/off, effect picker, intensity
+  slider). Also writes `state.json`.
+- The binary polls that file, so changes apply within ~1 s.
 
-> **Why not `ttfx`?** `ttfx` (the `Hypa.Ttfx` .NET build on this box) only animates on an
-> interactive TTY. Fed via a pipe — even through a real PTY — it emits **0 bytes** and the window
-> stays black, so it cannot serve as a continuous background. The effects here are our own stdlib
-> renderers that replace ttfx's look (matrix/bars/wave/radial) while being continuous and
-> audio-reactive.
+## Running
 
-> **Why a QML `Image` and not a QML `Canvas`?** On this Quickshell 0.3.1 build a `Canvas` inside a
-> `PanelWindow` does not repaint from a `Timer`/`requestPaint()` (onPaint fires once at startup, then
-> never again), so the canvas stays blank. A `PanelWindow` `Image` is proven to render in this shell
-> (it is exactly how Omarchy's own wallpaper works), so we render frames in python and display them
-> via the Image. This is reliable and low-CPU.
+The background is meant to run as a **systemd user service** (so it survives agent /
+shell restarts and auto-restarts on failure):
+
+```sh
+cp ttfx-bg.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ttfx-bg.service
+```
+
+The service inherits the graphical-session environment (`WAYLAND_DISPLAY`,
+`HYPRLAND_INSTANCE_SIGNATURE`, `DBUS_SESSION_BUS_ADDRESS`) from `systemctl --user
+show-environment`. To run manually for debugging:
+
+```sh
+cd bin/ttfx-bg-rs
+cargo build --release
+WAYLAND_DISPLAY=wayland-1 \
+HYPRLAND_INSTANCE_SIGNATURE=<from `echo $HYPRLAND_INSTANCE_SIGNATURE`> \
+  ./target/release/ttfx-bg-rs
+```
 
 ## Files
-- `analyzer_light.py` — stdlib audio analyzer (Goertzel per band). `--test` synthesizes a sweep.
-- `analyzer_daemon.py` — `parec` + analyzer → publishes `/tmp/ttfx_bg_spectrum.json`.
-- `render_bg.py` — draws the current effect to `~/.cache/omarchy/ttfx_bg.png` (pure stdlib PNG).
-- `Service.qml` — layer-shell background (`service` kind) that displays the PNG.
-- `BarWidget.qml` + `manifest.json` — the Omarchy bar widget (toggle + effect menu).
-- `bin/set_state.py` — writes `state.json` (running/effect/rotate/words) for the bar widget.
-- `visualizer.py`, `medidor.py`, `bin/omarchy-ttfx-background` — earlier foot/ANSI prototypes
-  (kept for reference; superseded by the layer-shell approach above).
+
+- `bin/ttfx-bg-rs/src/main.rs` — layer-shell windows (one per monitor), Vte host,
+  `state.json` polling, renderer lifecycle.
+- `bin/ttfx-bg-rs/Cargo.toml` — gtk4, gtk4-layer-shell, vte4, rand, anyhow.
+- `manifest.json` — plugin manifest (kinds: `bar-widget`, `service`, `panel`).
+- `BarWidget.qml` — bar icon / opens config panel.
+- `Panel.qml` — configuration panel (toggle, effect, intensity).
+- `icon.svg` — plugin icon (music note over rectangle).
+- `ttfx-bg.service` — systemd user service unit.
+- `ttfx-src/` — git submodule: [`omacom/ttfx`](https://github.com/omacom/ttfx)
+  (upstream effects engine, not yet wired in — see Roadmap).
 
 ## Requirements
-- `parec` (PipeWire/Pulse). A Wayland session for the display; the analyzer `--test` works headless.
 
-## Verify the analyzer (headless)
-```sh
-cd /home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background
-python3 analyzer_light.py --test
-```
-The dominant band (`^`) should climb 60Hz → … → 16000Hz.
+- Rust toolchain (rustup), plus `gtk4`, `gtk4-layer-shell`, `vte4` dev headers
+  (`pkg-config` path must include them; on this box they live under
+  `~/.local/share/pkgconfig`).
+- A Wayland session (Hyprland). CPU stays well under 5% (idle animation in Vte).
 
-## Install / enable
-Local plugins are installed by **symlink** (Omarchy discovers `~/.config/omarchy/plugins/<id>`),
-then enabled:
+## Roadmap
+
+The goal is to use **ttfx** as the effects engine, vendored as a git submodule so it
+can be updated from upstream:
+
+1. **Bridge ttfx (Step 1).** Expose `ttfx`'s effect engine as a library (or a thin
+   wrapper crate) and call it from `bin/ttfx-bg-rs` instead of the hand-rolled
+   renderer — replacing the placeholder `matrix`/`rain`/`wave`/`bars` with ttfx's
+   real matrix / rain / fireworks / etc. effects. `ttfx-src/` is already a submodule
+   at `omacom/ttfx`; the bridge is the missing piece.
+2. **Audio-reactive (Step 2).** Feed system audio into the engine (PulseAudio /
+   PipeWire monitor capture) so the animations react to music, as the original
+   concept intended.
+
+## Install / enable the plugin
+
+Local plugins are installed by **symlink** (Omarchy discovers
+`~/.config/omarchy/plugins/<id>`), then enabled:
+
 ```sh
 ln -sfn /home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background \
        ~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background
 omarchy plugin enable io.github.avillagran.omarchy-ttfx-background --section right
 omarchy-shell shell rescanPlugins   # if the plugin is not yet known
 ```
-(`omarchy plugin add` is git-only and won't accept a local path.) After enabling, restart the shell
-(`omarchy-restart-shell`) so the `service` kind loads. Left-click the widget to toggle the
-background; right-click to pick the effect or toggle rotation.
 
-## Monitor source — IMPORTANT (real bug found)
-The default sink on this box is an **effect sink** (`audio_effect.j416-convolver`), not the
-headphones device. A hardcoded `…Headphones__sink.monitor` captures **silence** because music is
-routed through the effect sink first. `analyzer_daemon.py` resolves the monitor dynamically:
-`pactl get-default-sink` + `.monitor` → `audio_effect.j416-convolver.monitor` (RUNNING while audio
-plays). Override with `TTFX_MONITOR=<source>` if your routing differs. Verified: with the correct
-monitor the visualizer tracks YouTube Music / any system audio (vol 0.4→1.0 in real time).
+(`omarchy plugin add` is git-only and won't accept a local path.) After enabling,
+restart the shell (`omarchy-restart-shell`) so the `service` / `panel` kinds load.
+Left-click the bar widget to open the config panel.
 
 ## Notes / limitations
-- Resolution is low (320×180) and upscaled — intentionally blocky/retro and very low CPU. Bump
-  `W, H` in `render_bg.py` for sharper output at higher cost.
-- `Image` reload uses a cache-buster query each frame; at ~24 fps the background is smooth.
-- The background sits on the Bottom layer, so maximized app windows cover it (that is the point of
-  a real background). It shows on the bare desktop / behind translucent windows.
+
+- The background sits on the Bottom layer, so maximized app windows cover it (that is
+  the point of a real background). It shows on the bare desktop / behind translucent
+  windows.
+- Font size is computed in physical pixels divided by the monitor scale factor, so the
+  glyph grid scales with the screen resolution (dense on 4K, coarser on small panels)
+  instead of a few giant characters.
+- Renderer effects are placeholders until the ttfx bridge (Step 1) lands.
