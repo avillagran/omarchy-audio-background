@@ -67,10 +67,21 @@ impl Default for Config {
     }
 }
 
+// state.json lives in ~/.local/state/omarchy/... — NOT in the plugin source dir.
+// The shell runs `inotifywait -r` on ~/.config/omarchy/plugins and RELOADS the
+// plugin on any file change there, which closed the open panel on every write
+// (and respawned everything). Runtime state belongs in the XDG state dir, like
+// the other plugins (control-panel-prefs.json etc.).
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json")
+    PathBuf::from(home).join(".local/state/omarchy/audio-background/state.json")
+}
+
+// Legacy location (inside the plugin dir) — read once for migration if the new
+// path doesn't exist yet.
+fn legacy_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json")
 }
 
 // Best-effort read of the panel's state.json. Missing/invalid => defaults.
@@ -78,7 +89,10 @@ fn config_path() -> PathBuf {
 // line carries every key at once.
 fn read_config() -> Config {
     let mut cfg = Config::default();
-    let text = match std::fs::read_to_string(config_path()) {
+    // New XDG-state path first, legacy plugin-dir path as a one-time migration read.
+    let text = std::fs::read_to_string(config_path())
+        .or_else(|_| std::fs::read_to_string(legacy_config_path()));
+    let text = match text {
         Ok(t) => t,
         Err(_) => return cfg,
     };
@@ -184,7 +198,8 @@ fn main() -> Result<()> {
     let windows: Rc<RefCell<Vec<gtk4::ApplicationWindow>>> = Rc::new(RefCell::new(Vec::new()));
     let cfg0 = read_config();
     let active_effect: Rc<RefCell<String>> = Rc::new(RefCell::new(
-        if cfg0.effects.contains(&cfg0.effect) { cfg0.effect.clone() }
+        // Honor a picked effect even if it isn't in the rotation set.
+        if is_valid_effect(&cfg0.effect) { cfg0.effect.clone() }
         else { cfg0.effects.first().cloned().unwrap_or_else(|| "matrix".into()) }
     ));
     let last_cfg: Rc<RefCell<Config>> = Rc::new(RefCell::new(cfg0));
@@ -234,7 +249,7 @@ fn main() -> Result<()> {
                 let old = lc.borrow().clone();
                 // If the active-effect selection changed, honor it; otherwise
                 // keep rotating from where we are.
-                if cfg.effect != old.effect && cfg.effects.contains(&cfg.effect) {
+                if cfg.effect != old.effect && is_valid_effect(&cfg.effect) {
                     *ae.borrow_mut() = cfg.effect.clone();
                 }
                 *lc.borrow_mut() = cfg.clone();
@@ -676,6 +691,22 @@ fn pty_size() -> Option<(usize, usize)> {
     }
 }
 
+// Wait for Vte to size the PTY to the real widget dimensions (it spawns at 80x24
+// and resizes a beat later), returning the settled (cols, rows). Reading too early
+// lays a one-shot layout (the intro, a ttfx canvas) out on an 80x24 grid.
+fn settle_pty_size(fallback_cols: usize, fallback_rows: usize) -> (usize, usize) {
+    let fallback = (fallback_cols, fallback_rows);
+    let mut prev = pty_size().unwrap_or(fallback);
+    let mut settled = if prev != (80, 24) { prev } else { fallback };
+    for _ in 0..150 {  // up to ~1.5s
+        let cur = pty_size().unwrap_or(fallback);
+        if cur != (80, 24) && cur == prev { settled = cur; break; }
+        prev = cur;
+        thread::sleep(Duration::from_millis(10));
+    }
+    settled
+}
+
 // 5-row ASCII bitmap font (FIGlet-style, pure ASCII '#'/space). Each glyph is 5
 // rows tall; `intro_size` scales each font pixel into an N×N cell block, so the
 // title renders as real ASCII-art letters — not a per-char solid block.
@@ -830,66 +861,74 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     thread::sleep(Duration::from_millis(2600));
 }
 
-// Bridge to the vendored ttfx engine (ttfx-src), used as a LIBRARY. Builds one ttfx
-// effect and drives it on our Vte PTY (the render child's stdout is a tty), so the
-// background can run ttfx's effects in-process instead of shelling out to a separate
-// ttfx binary. First integration step: proves the bridge. Audio-reactive drive and
-// mapping the whole catalog come next.
+// ttfx effects we route to the vendored engine (everything in the catalog EXCEPT
+// matrix/rain, which we keep hand-rolled because ours are audio-reactive).
+const TTFX_EFFECTS: [&str; 35] = [
+    "beams", "binarypath", "blackhole", "bouncyballs", "bubbles", "burn", "colorshift",
+    "crumble", "decrypt", "errorcorrect", "expand", "fireworks", "highlight", "laseretch",
+    "middleout", "orbittingvolley", "overflow", "pour", "print", "randomsequence", "rings",
+    "scattered", "slice", "slide", "smoke", "spotlights", "spray", "swarm", "sweep",
+    "synthgrid", "thunderstorm", "unstable", "vhstape", "waves", "wipe",
+];
+
+fn is_ttfx_effect(name: &str) -> bool { TTFX_EFFECTS.contains(&name) }
+
+// Any effect the renderer can actually run: our hand-rolled set or the ttfx catalog.
+fn is_valid_effect(name: &str) -> bool { DEFAULT_EFFECTS.contains(&name) || is_ttfx_effect(name) }
+
+// Drive a vendored ttfx effect on our Vte PTY, looping so it runs as a continuous
+// background (ttfx effects settle when done; rebuild and replay). Handles PTY resize
+// by rebuilding at the new size. Runs after our ASCII intro (same stdout).
 fn run_ttfx(effect_name: &str, cols: usize, rows: usize) -> Result<()> {
     use clap::Parser;
     use ttfx::engine::ctx::{Clock, EngineCtx};
+    use ttfx::engine::effect::{run_effect, RunOutcome};
     use ttfx::engine::terminal::TerminalConfig;
     use ttfx::utils::rng::Rng;
 
-    let mut effect = match ttfx::cli::Cli::try_parse_from(["ttfx", effect_name]) {
-        Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
-        _ => { eprintln!("unknown ttfx effect: {effect_name}"); return Ok(()); }
-    };
-
-    // Canvas content the effect animates — a screenful sized to our grid (kept
-    // non-blank so the engine accepts it).
-    let mut input = String::new();
-    for r in 0..rows {
-        for c in 0..cols { input.push(if (r + c) % 7 == 0 { '.' } else { ' ' }); }
-        if r + 1 < rows { input.push('\n'); }
+    let (mut cols, mut rows) = settle_pty_size(cols, rows);
+    loop {
+        let mut effect = match ttfx::cli::Cli::try_parse_from(["ttfx", effect_name]) {
+            Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
+            _ => { eprintln!("unknown ttfx effect: {effect_name}"); return Ok(()); }
+        };
+        // Canvas content the effect animates. Keep it nearly EMPTY (a token sparse
+        // dot here and there, just non-blank so the engine accepts it) so the
+        // effect's OWN visuals (rain, fire, beams…) dominate instead of a dense
+        // input pattern. Text-forming effects would want real input, but the
+        // background favors ambient effects.
+        let mut input = String::new();
+        for r in 0..rows {
+            for c in 0..cols { input.push(if (r * 7 + c * 13) % 2003 == 0 { '.' } else { ' ' }); }
+            if r + 1 < rows { input.push('\n'); }
+        }
+        let mut config = TerminalConfig::default();
+        config.canvas_width = cols as i64;
+        config.canvas_height = rows as i64;
+        config.frame_rate = 60;
+        let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::real()) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("ttfx ctx error: {e:?}"); return Ok(()); }
+        };
+        match run_effect(effect.as_mut(), &mut ctx, true) {
+            // Settled: brief pause then replay (continuous background).
+            Ok(RunOutcome::Complete) => thread::sleep(Duration::from_millis(400)),
+            Ok(RunOutcome::TerminalResized) => {
+                let (c, r) = settle_pty_size(cols, rows);
+                cols = c; rows = r;
+            }
+            // Interrupted / Terminated / OutputClosed: stop.
+            Ok(_) => return Ok(()),
+            Err(e) => { eprintln!("ttfx run error: {e:?}"); return Ok(()); }
+        }
     }
-
-    let mut config = TerminalConfig::default();
-    config.canvas_width = cols as i64;
-    config.canvas_height = rows as i64;
-    config.frame_rate = 60;
-
-    let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::real()) {
-        Ok(c) => c,
-        Err(e) => { eprintln!("ttfx ctx error: {e:?}"); return Ok(()); }
-    };
-    if let Err(e) = ttfx::engine::effect::run_effect(effect.as_mut(), &mut ctx, true) {
-        eprintln!("ttfx run error: {e:?}");
-    }
-    Ok(())
 }
 
 fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
-    // Use the REAL PTY size, but WAIT for it to settle first: Vte spawns the pty at
-    // the 80x24 default and resizes it to the widget a beat later. The intro runs
-    // only once, so if we read the size too early the whole ASCII-art splash is laid
-    // out on an 80x24 grid (clipped + parked top-left) while the effects — which
-    // re-check the size every frame — look fine. Poll until the size is stable and
-    // no longer the 80x24 default before drawing anything.
-    let (cols, rows) = {
-        let fallback = (cols, rows);
-        let mut prev = pty_size().unwrap_or(fallback);
-        let mut settled = if prev != (80, 24) { prev } else { fallback };
-        for _ in 0..150 {  // up to ~1.5s
-            let cur = pty_size().unwrap_or(fallback);
-            if cur != (80, 24) && cur == prev { settled = cur; break; }
-            prev = cur;
-            thread::sleep(Duration::from_millis(10));
-        }
-        settled
-    };
+    // Use the REAL PTY size, but WAIT for it to settle first (Vte spawns at 80x24).
+    let (cols, rows) = settle_pty_size(cols, rows);
     let mut scr = Screen::new(cols, rows, show_fps);
 
     let palette: &[&str] = match effect {
@@ -905,6 +944,12 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
 
     if with_intro {
         show_intro(&mut scr, palette, byline, effect, intro_size);
+    }
+
+    // ttfx effects drive the vendored engine on this same PTY (after our intro).
+    if is_ttfx_effect(effect) {
+        run_ttfx(effect, cols, rows);
+        return Ok(());
     }
 
     // Each effect returns Ok(()) when it detects a PTY resize; re-dispatch so

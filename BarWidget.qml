@@ -10,7 +10,7 @@ BarWidget {
   moduleName: "io.github.avillagran.omarchy-audio-background"
 
   readonly property string stateFile: Quickshell.env("HOME") +
-    "/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
+    "/.local/state/omarchy/audio-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
 
   property bool running: true

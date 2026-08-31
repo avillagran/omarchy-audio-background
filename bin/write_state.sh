@@ -14,7 +14,7 @@
 #   write_state.sh byline=Some text     (intro byline; empty = default)
 #   write_state.sh restart              (bump restart counter -> replay intro)
 set -e
-STATE="${HOME}/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
+STATE="${HOME}/.local/state/omarchy/audio-background/state.json"
 mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)

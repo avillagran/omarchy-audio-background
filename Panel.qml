@@ -16,7 +16,7 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   readonly property string stateFile: Quickshell.env("HOME") +
-    "/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
+    "/.local/state/omarchy/audio-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
 
   property bool running: true
@@ -32,6 +32,9 @@ Panel {
   property string label: "♪"
 
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
+  // Vendored ttfx effects (rendered by the ttfx engine). matrix/rain stay hand-rolled
+  // (ours are audio-reactive); these are the extra ttfx catalog worth offering.
+  readonly property var ttfxEffects: ["beams", "blackhole", "bubbles", "burn", "colorshift", "fireworks", "rings", "synthgrid", "thunderstorm", "vhstape", "swarm", "spray"]
 
   // NOTE: opened / open / close / toggle / closeForPopoutSwitch are provided
   // by the qs.Ui.Panel base type — do NOT redeclare them (QML forbids
@@ -54,6 +57,14 @@ Panel {
     introReplay.restart()   // the intro renders once at startup; replay it at the new size (debounced)
   }
   function setByline(t)    { root.byline = t;    write("byline="    + t); }
+  // Cycle the active effect across the full catalog (built-ins + ttfx) with ◀ ▶.
+  function cycleEffect(dir) {
+    var list = root.allEffects.concat(root.ttfxEffects)
+    var i = list.indexOf(root.effect)
+    if (i < 0) i = 0
+    i = (i + dir + list.length) % list.length
+    root.pickEffect(list[i])
+  }
   function toggleEffect(e, on) {
     var list = root.effects.slice()
     var i = list.indexOf(e)
@@ -111,7 +122,7 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(540))
     // Height must follow the content or the card stays at the default
     // contentHeight (200) and the taller layout overflows below it, leaving
     // most controls rendered on bare desktop with no card behind them.
@@ -184,22 +195,71 @@ Panel {
 
         PanelSectionHeader { text: "BACKGROUNDS" }
 
-        // Enabled set with per-effect toggle; >1 enabled => rotates (see ROTATION).
-        Repeater {
-          model: root.allEffects
-          RowLayout {
+        // Prev / next effect across the whole catalog.
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+          Button { text: "◀"; onClicked: root.cycleEffect(-1) }
+          Text {
+            text: root.effect
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : "sans"
+            font.pixelSize: Style.font.body
+            horizontalAlignment: Text.AlignHCenter
             Layout.fillWidth: true
-            spacing: Style.space(10)
-            Button {
-              text: modelData
-              selected: root.effect === modelData
-              onClicked: root.pickEffect(modelData)
+          }
+          Button { text: "▶"; onClicked: root.cycleEffect(1) }
+        }
+
+        // Enabled set with per-effect toggle, 2 per row so the whole catalog fits
+        // without making the panel too tall; >1 enabled => rotates (see ROTATION).
+        GridLayout {
+          columns: 2
+          Layout.fillWidth: true
+          columnSpacing: Style.space(10)
+          rowSpacing: Style.space(6)
+          Repeater {
+            model: root.allEffects
+            RowLayout {
               Layout.fillWidth: true
+              spacing: Style.space(6)
+              Button {
+                text: modelData
+                selected: root.effect === modelData
+                onClicked: root.pickEffect(modelData)
+                Layout.fillWidth: true
+              }
+              ToggleSwitch {
+                checked: root.effects.indexOf(modelData) >= 0
+                onToggled: root.toggleEffect(modelData, !(root.effects.indexOf(modelData) >= 0))
+              }
             }
-            ToggleSwitch {
-              checked: root.effects.indexOf(modelData) >= 0
-              // Controlled component: invert the current membership, don't pass `checked`.
-              onToggled: root.toggleEffect(modelData, !(root.effects.indexOf(modelData) >= 0))
+          }
+        }
+
+        PanelSectionHeader { text: "TTFX EFFECTS" }
+
+        // Vendored ttfx effects; same pick + rotation-toggle as the built-ins.
+        GridLayout {
+          columns: 2
+          Layout.fillWidth: true
+          columnSpacing: Style.space(10)
+          rowSpacing: Style.space(6)
+          Repeater {
+            model: root.ttfxEffects
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(6)
+              Button {
+                text: modelData
+                selected: root.effect === modelData
+                onClicked: root.pickEffect(modelData)
+                Layout.fillWidth: true
+              }
+              ToggleSwitch {
+                checked: root.effects.indexOf(modelData) >= 0
+                onToggled: root.toggleEffect(modelData, !(root.effects.indexOf(modelData) >= 0))
+              }
             }
           }
         }
