@@ -56,7 +56,7 @@ impl Default for Config {
             audio: true,
             byline: String::new(),
             restart: 0,
-            intro_size: 5,
+            intro_size: 2,
             show_fps: false,
         }
     }
@@ -154,7 +154,7 @@ fn main() -> Result<()> {
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
-        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
+        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
         return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps);
@@ -630,78 +630,180 @@ fn pty_size() -> Option<(usize, usize)> {
     }
 }
 
-// Intro: typewriter title + byline, then the effect takes over.
-// The whole intro stack (title + byline + effect tag) is centered on BOTH axes
-// as a single unit — previously the title's TOP was parked at rows/2, so the
-// block hung in the lower half. `intro_size` scales the block glyphs (1..16);
-// on HiDPI the cell grid is dense, so a large intro_size is what makes the boot
-// text actually read as a splash — hence the wide range.
+// 5-row ASCII bitmap font (FIGlet-style, pure ASCII '#'/space). Each glyph is 5
+// rows tall; `intro_size` scales each font pixel into an N×N cell block, so the
+// title renders as real ASCII-art letters — not a per-char solid block.
+fn glyph_rows(c: char) -> [&'static str; 5] {
+    match c {
+        'A' => [" ### ", "#   #", "#   #", "#####", "#   #"],
+        'B' => ["#### ", "#   #", "#### ", "#   #", "#### "],
+        'C' => [" ####", "#    ", "#    ", "#    ", " ####"],
+        'D' => ["#### ", "#   #", "#   #", "#   #", "#### "],
+        'E' => ["#####", "#    ", "#### ", "#    ", "#####"],
+        'F' => ["#####", "#    ", "#### ", "#    ", "#    "],
+        'G' => [" ####", "#    ", "#  ##", "#   #", " ####"],
+        'H' => ["#   #", "#   #", "#####", "#   #", "#   #"],
+        'I' => ["#####", "  #  ", "  #  ", "  #  ", "#####"],
+        'J' => ["#####", "   # ", "   # ", "#  # ", " ##  "],
+        'K' => ["#   #", "#  # ", "###  ", "#  # ", "#   #"],
+        'L' => ["#    ", "#    ", "#    ", "#    ", "#####"],
+        'M' => ["#   #", "## ##", "# # #", "#   #", "#   #"],
+        'N' => ["#   #", "##  #", "# # #", "#  ##", "#   #"],
+        'O' => [" ### ", "#   #", "#   #", "#   #", " ### "],
+        'P' => ["#### ", "#   #", "#### ", "#    ", "#    "],
+        'Q' => [" ### ", "#   #", "# # #", "#  # ", " ## #"],
+        'R' => ["#### ", "#   #", "#### ", "#  # ", "#   #"],
+        'S' => [" ####", "#    ", " ### ", "    #", "#### "],
+        'T' => ["#####", "  #  ", "  #  ", "  #  ", "  #  "],
+        'U' => ["#   #", "#   #", "#   #", "#   #", " ### "],
+        'V' => ["#   #", "#   #", "#   #", " # # ", "  #  "],
+        'W' => ["#   #", "#   #", "# # #", "## ##", "#   #"],
+        'X' => ["#   #", " # # ", "  #  ", " # # ", "#   #"],
+        'Y' => ["#   #", " # # ", "  #  ", "  #  ", "  #  "],
+        'Z' => ["#####", "   # ", "  #  ", " #   ", "#####"],
+        '0' => [" ### ", "#  ##", "# # #", "##  #", " ### "],
+        '1' => ["  #  ", " ##  ", "  #  ", "  #  ", "#####"],
+        '2' => [" ### ", "#   #", "  ## ", " #   ", "#####"],
+        '3' => ["#### ", "    #", " ### ", "    #", "#### "],
+        '4' => ["#  # ", "#  # ", "#####", "   # ", "   # "],
+        '5' => ["#####", "#    ", "#### ", "    #", "#### "],
+        '6' => [" ### ", "#    ", "#### ", "#   #", " ### "],
+        '7' => ["#####", "   # ", "  #  ", " #   ", "#    "],
+        '8' => [" ### ", "#   #", " ### ", "#   #", " ### "],
+        '9' => [" ### ", "#   #", " ####", "    #", " ### "],
+        '.' => ["     ", "     ", "     ", "     ", "  #  "],
+        ',' => ["     ", "     ", "     ", "  #  ", " #   "],
+        '/' => ["    #", "   # ", "  #  ", " #   ", "#    "],
+        '@' => [" ### ", "# ###", "# # #", "# ## ", " ### "],
+        '-' => ["     ", "     ", " ### ", "     ", "     "],
+        ':' => ["     ", "  #  ", "     ", "  #  ", "     "],
+        '!' => ["  #  ", "  #  ", "  #  ", "     ", "  #  "],
+        '?' => [" ### ", "#   #", "  ## ", "     ", "  #  "],
+        '+' => ["     ", "  #  ", " ### ", "  #  ", "     "],
+        '_' => ["     ", "     ", "     ", "     ", "#####"],
+        '(' => ["   # ", "  #  ", "  #  ", "  #  ", "   # "],
+        ')' => ["#    ", " #   ", " #   ", " #   ", "#    "],
+        '\'' => ["  #  ", "  #  ", "     ", "     ", "     "],
+        _ => ["     ", "     ", "     ", "     ", "     "],
+    }
+}
+
+// Uppercase + normalize dashes so any byline / effect name maps onto the font.
+fn prep(s: &str) -> String {
+    s.chars().map(|c| match c { '—' | '–' => '-', other => other.to_ascii_uppercase() }).collect()
+}
+
+// Render the first `upto` chars of `text` as scaled ASCII-art rows (each font
+// pixel becomes an N×N cell block). All glyphs are 5 rows × 5 cols.
+fn art_prefix(text: &str, upto: usize, scale: usize, gap: usize) -> Vec<String> {
+    let mut rows = vec![String::new(); 5 * scale];
+    for ch in text.chars().take(upto) {
+        let g = glyph_rows(ch);
+        for r in 0..5 {
+            let mut scaled = String::new();
+            for c in g[r].chars() { for _ in 0..scale { scaled.push(c); } }
+            for sy in 0..scale {
+                rows[r * scale + sy].push_str(&scaled);
+                for _ in 0..gap { rows[r * scale + sy].push(' '); }
+            }
+        }
+    }
+    rows
+}
+
+// Nominal rendered width of `text` as ASCII art (glyphs are 5 cols + `gap`).
+fn art_width(text: &str, scale: usize, gap: usize) -> usize {
+    let n = text.chars().count();
+    if n == 0 { 0 } else { n * (5 * scale + gap) - gap }
+}
+
+// Intro: the title, byline and effect tag ALL render as ASCII art (scaled
+// ×1..×3), centered on BOTH axes as a single stack. The title types in letter by
+// letter, then the byline, then the effect tag, then it holds.
 fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, intro_size: i64) {
-    let scale = intro_size.clamp(1, 16) as usize;
-    let title = "OMARCHY AUDIO BACKGROUND";
-    let by = if byline.trim().is_empty() { DEFAULT_BYLINE } else { byline.trim() };
+    let scale = intro_size.clamp(1, 3) as usize;
+    let gap = scale.max(1); // spaces between ASCII-art letters
+    let title = "OMARCHY AUDIO BACKGROUND".to_string();
+    let by = prep(if byline.trim().is_empty() { DEFAULT_BYLINE } else { byline.trim() });
+    let tag = format!("- {} -", prep(effect));
 
-    // Block glyphs: each char becomes a `scale`×`scale` cell block. A cell is
-    // `scale`× wider AND `scale`× taller, so this is uniform pixel scaling.
-    // Tracking between letters grows with size so glyphs don't fuse when big.
-    let ls = if scale > 1 { (scale / 5).max(1) } else { 0 };  // letter spacing (cells)
-    let adv = scale + ls;                          // horizontal advance per char
-    let block_h = scale;
-    let title_w = title.len() * adv - ls;
+    let bh = 5 * scale;   // every block is 5 glyph rows × scale
+    let vgap = 1usize;    // blank row between blocks
 
-    // Vertical layout of the whole stack, then center it.
-    let gap = 1usize;
-    let byline_off = block_h + gap;                // byline row offset from block top
-    let tag_off = byline_off + 1 + gap;            // effect-tag row offset
-    let total_h = tag_off + 1;
-    let ty = scr.rows.saturating_sub(total_h) / 2; // top of the centered block
-    let tx = scr.cols.saturating_sub(title_w) / 2;
-    let bx = scr.cols.saturating_sub(by.len()) / 2;
+    let title_w = art_width(&title, scale, gap);
+    let by_w = art_width(&by, scale, gap);
+    let tag_w = art_width(&tag, scale, gap);
 
-    let draw_title = |scr: &mut Screen, upto: usize| {
-        for (i, ch) in title.chars().take(upto).enumerate() {
-            let cx = tx + i * adv;
-            for dx in 0..scale { for dy in 0..block_h {
-                scr.put(cx + dx, ty + dy, ch, 1);
-            }}
+    // Center the whole 3-block stack vertically, each block centered horizontally.
+    let total_h = 3 * bh + 2 * vgap;
+    let ty = scr.rows.saturating_sub(total_h) / 2;
+    let by_y = ty + bh + vgap;
+    let tag_y = by_y + bh + vgap;
+    let tx_title = scr.cols.saturating_sub(title_w) / 2;
+    let tx_by = scr.cols.saturating_sub(by_w) / 2;
+    let tx_tag = scr.cols.saturating_sub(tag_w) / 2;
+
+    // Draw the first `upto` letters of a block at its (centered) left edge, so the
+    // typewriter fills left-to-right and ends centered.
+    let draw = |scr: &mut Screen, text: &str, upto: usize, x: usize, y: usize, color: u8| {
+        for (r, line) in art_prefix(text, upto, scale, gap).iter().enumerate() {
+            for (i, ch) in line.chars().enumerate() {
+                if ch != ' ' { scr.put(x + i, y + r, ch, color); }
+            }
         }
     };
 
-    // Typewriter: title.
-    for step in 0..=title.len() {
+    let title_len = title.chars().count();
+    let by_len = by.chars().count();
+    let tag_len = tag.chars().count();
+
+    // Phase 1: type the title, one ASCII-art letter at a time.
+    for step in 0..=title_len {
         scr.clear();
-        draw_title(scr, step);
+        draw(scr, &title, step, tx_title, ty, 1);
         scr.fps_overlay();
         scr.present(palette);
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(70));
     }
-    // Byline types in under the (now complete) title.
-    for step in 0..=by.len() {
+    // Phase 2: type the byline under the complete title.
+    for step in 0..=by_len {
         scr.clear();
-        draw_title(scr, title.len());
-        for (i, ch) in by.chars().take(step).enumerate() { scr.put(bx + i, ty + byline_off, ch, 2); }
+        draw(scr, &title, title_len, tx_title, ty, 1);
+        draw(scr, &by, step, tx_by, by_y, 2);
         scr.fps_overlay();
         scr.present(palette);
-        thread::sleep(Duration::from_millis(14));
+        thread::sleep(Duration::from_millis(45));
     }
-    // Effect name stamp.
-    let tag = format!("— {effect} —");
-    let ex = scr.cols.saturating_sub(tag.len()) / 2;
-    for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + tag_off, ch, 3); }
+    // Phase 3: stamp the effect tag, then hold the finished splash.
+    scr.clear();
+    draw(scr, &title, title_len, tx_title, ty, 1);
+    draw(scr, &by, by_len, tx_by, by_y, 2);
+    draw(scr, &tag, tag_len, tx_tag, tag_y, 3);
+    scr.fps_overlay();
     scr.present(palette);
-    // Hold the finished splash long enough to actually read it — the intro is the
-    // "boot" moment, so don't flash past it (was 900ms; the big HiDPI text needs time).
     thread::sleep(Duration::from_millis(2600));
 }
 
 fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
-    // Start at the REAL PTY size (Vte may round the spawn-time size); the
-    // effect loops re-check it each frame and restart cleanly on change.
-    let (cols, rows) = match pty_size() {
-        Some((c, r)) => (c, r),
-        None => (cols, rows),
+    // Use the REAL PTY size, but WAIT for it to settle first: Vte spawns the pty at
+    // the 80x24 default and resizes it to the widget a beat later. The intro runs
+    // only once, so if we read the size too early the whole ASCII-art splash is laid
+    // out on an 80x24 grid (clipped + parked top-left) while the effects — which
+    // re-check the size every frame — look fine. Poll until the size is stable and
+    // no longer the 80x24 default before drawing anything.
+    let (cols, rows) = {
+        let fallback = (cols, rows);
+        let mut prev = pty_size().unwrap_or(fallback);
+        let mut settled = if prev != (80, 24) { prev } else { fallback };
+        for _ in 0..150 {  // up to ~1.5s
+            let cur = pty_size().unwrap_or(fallback);
+            if cur != (80, 24) && cur == prev { settled = cur; break; }
+            prev = cur;
+            thread::sleep(Duration::from_millis(10));
+        }
+        settled
     };
     let mut scr = Screen::new(cols, rows, show_fps);
 

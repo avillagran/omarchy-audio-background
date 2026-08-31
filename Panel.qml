@@ -25,7 +25,7 @@ Panel {
   property string effect: "matrix"
   property var effects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   property int intensity: 5
-  property int introSize: 5
+  property int introSize: 2
   property string byline: ""
   property string label: "♪"
 
@@ -211,7 +211,7 @@ Panel {
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
-          minimum: 1; maximum: 16; step: 1; integer: true
+          minimum: 1; maximum: 3; step: 1; integer: true
           value: root.introSize
           onMoved: function(v) { root.setIntroSize(v) }
         }

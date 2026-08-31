@@ -55,7 +55,7 @@ brightness follows band energy smoothly.
 {
   "running": true, "audio": true, "effect": "matrix",
   "effects": ["matrix","rain","wave","bars","donut","fire","starfield","life"],
-  "intensity": 5, "byline": "", "restart": 0, "intro_size": 5
+  "intensity": 5, "byline": "", "restart": 0, "intro_size": 2
 }
 ```
 
@@ -66,8 +66,8 @@ brightness follows band energy smoothly.
 - `intensity` — 0–10, animation speed / trail length.
 - `byline` — intro signature text; empty = default `By x.com/@avillagran`.
 - `restart` — counter; bump to replay the intro (bar-widget right-click).
-- `intro_size` — 1–16, intro title text scale. On dense HiDPI grids use a higher
-  value for a readable boot splash; centered horizontally and vertically.
+- `intro_size` — 1–3, intro title scale (default 2). The title renders as ASCII art
+  (a 5-row bitmap font, each pixel scaled ×N), centered horizontally and vertically.
 
 ## Control from the bar
 
