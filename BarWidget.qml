@@ -9,14 +9,12 @@ BarWidget {
   id: root
   moduleName: "io.github.avillagran.omarchy-audio-background"
 
-  readonly property string iconPath: Qt.resolvedUrl("icon.svg").toString().replace("file://", "")
   readonly property string stateFile: Quickshell.env("HOME") +
     "/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
 
   property bool running: true
   property string effect: "matrix"
-  property int intensity: 5
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   function open()    { if (panelLoader.item && panelLoader.item.open)    panelLoader.item.open() }
@@ -27,11 +25,16 @@ BarWidget {
     var t = panelLoader.item
     if (!t) return
     if ("bar" in t) t.bar = root.bar
-    if ("anchorItem" in t) t.anchorItem = root
+    if ("anchorItem" in t) t.anchorItem = button
     if ("hostWidget" in t) t.hostWidget = root
   }
 
   function refresh() { statusProc.running = true }
+
+  // Right click: restart the background (bump restart counter -> replays intro).
+  function restartBackground() {
+    Quickshell.execDetached(["sh", root.writeState, "restart"])
+  }
 
   Process {
     id: statusProc
@@ -43,14 +46,16 @@ BarWidget {
           var s = JSON.parse(text || "{}")
           if (typeof s.running === "boolean") root.running = s.running
           if (typeof s.effect === "string")   root.effect  = s.effect
-          if (typeof s.intensity === "number") root.intensity = s.intensity
         } catch (e) {}
       }
     }
   }
 
-  Timer { id: pollTimer; interval: 800; repeat: false; onTriggered: root.refresh() }
+  Timer { id: pollTimer; interval: 900; repeat: false; onTriggered: root.refresh() }
   Component.onCompleted: root.refresh()
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
 
   Loader {
     id: panelLoader
@@ -60,21 +65,16 @@ BarWidget {
     onLoaded: { root.injectPanel(); Qt.callLater(root.injectPanel) }
   }
 
-  // Icon (music note over rectangle). Click opens the config panel.
-  implicitWidth: icon.implicitWidth
-  implicitHeight: icon.implicitHeight
-  Image {
-    id: icon
-    source: "file://" + root.iconPath
-    sourceSize.width: 16; sourceSize.height: 16
-    fillMode: Image.PreserveAspectFit
-  }
-
-  MouseArea {
+  // Theme-colored, optically centered glyph (white/black follows the bar).
+  BarIconButton {
+    id: button
     anchors.fill: parent
-    acceptedButtons: Qt.LeftButton | Qt.RightButton
-    onClicked: function(m) {
-      if (m.button === Qt.RightButton) root.refresh()
+    bar: root.bar
+    text: "♪"
+    active: !root.running
+    onPressed: function(b) {
+      if (!root.bar) return
+      if (b === Qt.RightButton) root.restartBackground()
       else root.togglePanel()
     }
   }
