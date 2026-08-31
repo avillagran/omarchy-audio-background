@@ -1,11 +1,17 @@
 [Unit]
-Description=ttfx matrix audio-reactive desktop background
+Description=ttfx audio-reactive desktop background (Rust layer-shell renderer)
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'set -a; source <(systemctl --user show-environment); set +a; exec setsid /home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background/bin/ttfx_bg.sh'
-Restart=on-failure
+# Run the Rust background directly. systemd --user already inherits the
+# graphical session environment (WAYLAND_DISPLAY, HYPRLAND_*, DBUS_*) that was
+# imported via `systemctl --user import-environment`, so no `source` needed.
+# No `setsid`: it would detach the tracked PID and make systemd think the
+# service exited.
+ExecStart=/home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background/bin/ttfx-bg-rs/target/release/ttfx-bg-rs
+Restart=always
 RestartSec=1
 
 [Install]
