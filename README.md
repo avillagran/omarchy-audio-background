@@ -28,29 +28,54 @@ reads as a genuine living desktop.
 
 ### Effects
 
-`matrix` (green, default) · `rain` (cyan) · `wave` (magenta) · `bars` (yellow).
-Each is a color scheme of the same column-rain renderer; `intensity` (0–10) scales
-speed and trail length. These are placeholders until the real `ttfx` effects land.
+`matrix` (green rain) · `rain` (cyan rain) · `wave` (sine) · `bars` (spectrum) ·
+`donut` (3D torus) · `fire` (doom fire) · `starfield` · `life` (Conway). Enable
+any subset in the panel; with more than one enabled the parent rotates the active
+effect every 20 s.
+
+### Audio reactivity (per-band, like the reference implementation)
+
+The renderer spawns `parec` on the default sink monitor and runs a Goertzel
+per-band analysis (24 bands, log-spaced 60 Hz–10 kHz) with rolling-peak adaptive
+normalization — the same approach as the reference analyzer that "reacts
+correctly". Each effect consumes the shared `AudioState` (volume + beat + bands):
+- **matrix/rain**: each rain column maps to a frequency band — band energy raises
+  that column's fall speed and brightness (a "rain equalizer").
+- **bars**: a true spectrum equalizer (bar = band energy).
+- **wave/donut/fire/starfield/life**: volume modulates amplitude / spin / fuel /
+  speed / reseed density.
+Global volume also increases spawn density ("caudal") and frame rate. No blinking —
+brightness follows band energy smoothly.
 
 ### Configuration (`state.json`)
 
-`~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json`:
+`~/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json`:
 
 ```json
-{ "running": true, "effect": "matrix", "intensity": 5 }
+{
+  "running": true, "audio": true, "effect": "matrix",
+  "effects": ["matrix","rain","wave","bars","donut","fire","starfield","life"],
+  "intensity": 5, "byline": "", "restart": 0, "intro_size": 1
+}
 ```
 
-- `running` — background on/off (toggle in the config panel / bar widget).
-- `effect`  — `matrix` | `rain` | `wave` | `bars`.
+- `running` — background on/off.
+- `audio` — react to system audio on/off.
+- `effect` — active effect (used when only one is enabled).
+- `effects` — enabled set; >1 rotates every 20 s.
 - `intensity` — 0–10, animation speed / trail length.
+- `byline` — intro signature text; empty = default `By x.com/@avillagran`.
+- `restart` — counter; bump to replay the intro (bar-widget right-click).
+- `intro_size` — 1–3, intro title text scale.
 
 ## Control from the bar
 
-- `BarWidget.qml` — bar icon (music-note over rectangle). Left-click opens the config
-  panel; it writes `state.json`.
-- `Panel.qml` — the configuration panel (toggle on/off, effect picker, intensity
-  slider). Also writes `state.json`.
-- The binary polls that file, so changes apply within ~1 s.
+- `BarWidget.qml` — centered, theme-colored ♪ icon (white/black follows the bar).
+  Left-click opens the config panel; **right-click restarts the background**
+  (replays the intro).
+- `Panel.qml` — configuration panel: Enabled, React to audio, per-effect toggle
+  list, intensity slider, intro text size slider, intro byline field.
+- The binary polls `state.json` every 700 ms, so changes apply within ~1 s.
 
 ## Running
 

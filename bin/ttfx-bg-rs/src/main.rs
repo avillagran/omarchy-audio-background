@@ -42,6 +42,7 @@ struct Config {
     audio: bool,
     byline: String,
     restart: i64,
+    intro_size: i64,
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             audio: true,
             byline: String::new(),
             restart: 0,
+            intro_size: 1,
         }
     }
 }
@@ -79,6 +81,7 @@ fn read_config() -> Config {
     if let Some(v) = json_str(&text, "byline") { cfg.byline = v; }
     if let Some(v) = json_num(&text, "intensity") { cfg.intensity = v; }
     if let Some(v) = json_num(&text, "restart") { cfg.restart = v; }
+    if let Some(v) = json_num(&text, "intro_size") { cfg.intro_size = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -148,7 +151,8 @@ fn main() -> Result<()> {
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
-        return run_render(&effect, cols, rows, intensity, audio, &byline);
+        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size);
     }
 
     gtk4::init()?;
@@ -350,6 +354,7 @@ fn spawn_layer_for_monitor(
             "--intensity".into(), cfg.intensity.to_string(),
             "--audio".into(), audio.into(),
             "--byline".into(), byline,
+            "--intro-size".into(), cfg.intro_size.to_string(),
         ];
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         // Pre-clear so Vte doesn't flash its "N by M cells" placeholder while
@@ -380,26 +385,65 @@ fn spawn_layer_for_monitor(
 // Renderer child process
 // ---------------------------------------------------------------------------
 
-// Shared audio level 0..1 (as f32 bits) fed by the parec capture thread.
-struct AudioLevel(Arc<AtomicU32>);
+// Shared audio state fed by the parec capture thread. Per-band spectrum (like
+// the node@192.168.1.177 analyzer_light.py that reacted correctly): Goertzel
+// per band with adaptive rolling-peak normalization, plus volume + beat.
+const NBANDS: usize = 24;
+const SAMPLE_RATE: f32 = 24000.0;
+const CHUNK: usize = 1024; // samples per analysis frame (~43ms)
 
-impl AudioLevel {
+#[derive(Clone)]
+struct AudioState {
+    bands: Arc<Vec<AtomicU32>>, // per-band energy 0..1 (f32 bits)
+    volume: Arc<AtomicU32>,     // overall volume 0..1
+    beat: Arc<AtomicU32>,       // 1 shortly after a beat
+}
+
+impl AudioState {
     fn start(enabled: bool) -> Self {
-        let level = Arc::new(AtomicU32::new(0f32.to_bits()));
+        let st = AudioState {
+            bands: Arc::new((0..NBANDS).map(|_| AtomicU32::new(0f32.to_bits())).collect()),
+            volume: Arc::new(AtomicU32::new(0f32.to_bits())),
+            beat: Arc::new(AtomicU32::new(0)),
+        };
         if enabled {
-            let l = level.clone();
-            thread::spawn(move || audio_capture_loop(l));
+            let s = st.clone();
+            thread::spawn(move || audio_capture_loop(s));
         }
-        AudioLevel(level)
+        st
     }
-    fn get(&self) -> f32 {
-        f32::from_bits(self.0.load(Ordering::Relaxed))
+    fn volume(&self) -> f32 { f32::from_bits(self.volume.load(Ordering::Relaxed)) }
+    fn beat(&self) -> bool { self.beat.load(Ordering::Relaxed) != 0 }
+    // Band energy for screen column `c` out of `cols` (rain-equalizer mapping).
+    fn band_at(&self, c: usize, cols: usize) -> f32 {
+        let b = c * NBANDS / cols.max(1);
+        f32::from_bits(self.bands[b.min(NBANDS - 1)].load(Ordering::Relaxed))
     }
 }
 
-// Capture the default sink monitor via parec and keep a smoothed RMS level.
-// Fast attack, slow decay — flow follows the music without jittering.
-fn audio_capture_loop(level: Arc<AtomicU32>) {
+// Goertzel: energy of `freq` in the sample window (no full FFT needed).
+fn goertzel(samples: &[f32], rate: f32, freq: f32) -> f32 {
+    let n = samples.len();
+    let mut k = (0.5 + (n as f32 * freq) / rate) as i32;
+    if k <= 0 || k >= n as i32 { k = k.clamp(1, n as i32 - 1); }
+    let w = 2.0 * std::f32::consts::PI * k as f32 / n as f32;
+    let coeff = 2.0 * w.cos();
+    let (mut s_prev, mut s_prev2) = (0f32, 0f32);
+    for &x in samples {
+        let s = x + coeff * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = s;
+    }
+    s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2
+}
+
+// Capture the default sink monitor via parec and keep per-band energies.
+// Log-spaced bands 60Hz..10kHz, rolling-peak auto-normalization (quiet audio
+// still moves), fast-attack/slow-decay per band so it follows without jitter.
+fn audio_capture_loop(st: AudioState) {
+    let band_freqs: Vec<f32> = (0..NBANDS)
+        .map(|i| 60.0 * (10000.0f32 / 60.0).powf(i as f32 / (NBANDS - 1) as f32))
+        .collect();
     loop {
         let sink = std::process::Command::new("pactl")
             .args(["get-default-sink"])
@@ -413,7 +457,9 @@ fn audio_capture_loop(level: Arc<AtomicU32>) {
         };
         let monitor = format!("{sink}.monitor");
         let child = std::process::Command::new("parec")
-            .args(["--device", &monitor, "--format=s16le", "--rate=4000", "--channels=1", "--latency-msec=40"])
+            .args(["--device", &monitor, "--format=s16le",
+                   "--rate", &format!("{}", SAMPLE_RATE as u32),
+                   "--channels=1", "--latency-msec=40"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -422,23 +468,38 @@ fn audio_capture_loop(level: Arc<AtomicU32>) {
             Err(_) => { thread::sleep(Duration::from_secs(2)); continue; }
         };
         let mut out = child.stdout.take().unwrap();
-        let mut buf = [0u8; 640]; // ~40ms of 4kHz s16 mono
-        let mut ema = 0f32;
+        let mut buf = vec![0u8; CHUNK * 2];
+        let mut samples = vec![0f32; CHUNK];
+        let mut peak = 1e-6f32;
+        let mut prev_rms = 0f32;
+        let mut beat_hold = 0u32;
         loop {
-            match out.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let frames = n / 2;
-                    if frames == 0 { continue; }
-                    let mut sum = 0f32;
-                    for i in 0..frames {
-                        let s = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as f32 / 32768.0;
-                        sum += s * s;
+            match out.read_exact(&mut buf) {
+                Ok(()) => {
+                    for i in 0..CHUNK {
+                        samples[i] = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as f32 / 32768.0;
                     }
-                    let rms = (sum / frames as f32).sqrt();
-                    let norm = (rms / 0.18).min(1.0);
-                    ema = if norm > ema { ema * 0.5 + norm * 0.5 } else { ema * 0.93 + norm * 0.07 };
-                    level.store(ema.to_bits(), Ordering::Relaxed);
+                    let rms = (samples.iter().map(|v| v * v).sum::<f32>() / CHUNK as f32).sqrt();
+                    // per-band energies
+                    let mut frame_max = 0f32;
+                    let mut mags = [0f32; NBANDS];
+                    for (bi, &f) in band_freqs.iter().enumerate() {
+                        let m = goertzel(&samples, SAMPLE_RATE, f);
+                        mags[bi] = m;
+                        if m > frame_max { frame_max = m; }
+                    }
+                    // rolling-peak adaptive normalization
+                    peak = (peak * 0.995).max(frame_max).max(1e-6);
+                    for (bi, &m) in mags.iter().enumerate() {
+                        let norm = (m / peak).sqrt().min(1.0);
+                        st.bands[bi].store(norm.to_bits(), Ordering::Relaxed);
+                    }
+                    // volume + beat
+                    st.volume.store((rms * 4.0).min(1.0).to_bits(), Ordering::Relaxed);
+                    let beat = if rms > prev_rms * 1.35 && rms > 0.02 { beat_hold = 3; 1 }
+                               else if beat_hold > 0 { beat_hold -= 1; 1 } else { 0 };
+                    st.beat.store(beat, Ordering::Relaxed);
+                    prev_rms = rms;
                 }
                 Err(_) => break,
             }
@@ -502,39 +563,70 @@ impl Screen {
     }
 }
 
+// Actual size of the PTY we render into. The parent computes cols/rows from
+// font metrics, but Vte may round differently — rendering more rows than the
+// PTY has caused a visible one-line scroll ("jump") every frame. The child
+// queries the real size and clamps to it.
+fn pty_size() -> Option<(usize, usize)> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0 && ws.ws_row > 0
+        {
+            Some((ws.ws_col as usize, ws.ws_row as usize))
+        } else {
+            None
+        }
+    }
+}
+
 // Intro: typewriter title + byline, then the effect takes over.
-fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str) {
+// `intro_size` scales the block glyphs (1..3).
+fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, intro_size: i64) {
+    let scale = intro_size.clamp(1, 3) as usize;
     let title = "OMARCHY AUDIO BACKGROUND";
     let by = if byline.trim().is_empty() { DEFAULT_BYLINE } else { byline.trim() };
+    let block_h = scale;
     let ty = scr.rows / 2;
+    let tx = scr.cols.saturating_sub(title.len() * scale) / 2;
     let bx = scr.cols.saturating_sub(by.len()) / 2;
-    let tx = scr.cols.saturating_sub(title.len()) / 2;
     for step in 0..=title.len() {
         scr.clear();
         for (i, ch) in title.chars().take(step).enumerate() {
-            scr.put(tx + i, ty, ch, 1);
+            for dx in 0..scale { for dy in 0..block_h {
+                scr.put(tx + i * scale + dx, ty + dy, ch, 1);
+            }}
         }
         scr.present(palette);
-        thread::sleep(Duration::from_millis(28));
+        thread::sleep(Duration::from_millis(24));
     }
     for step in 0..=by.len() {
         scr.clear();
-        for (i, ch) in title.chars().enumerate() { scr.put(tx + i, ty, ch, 1); }
-        for (i, ch) in by.chars().take(step).enumerate() { scr.put(bx + i, ty + 2, ch, 2); }
+        for (i, ch) in title.chars().enumerate() {
+            for dx in 0..scale { for dy in 0..block_h {
+                scr.put(tx + i * scale + dx, ty + dy, ch, 1);
+            }}
+        }
+        for (i, ch) in by.chars().take(step).enumerate() { scr.put(bx + i, ty + block_h + 1, ch, 2); }
         scr.present(palette);
-        thread::sleep(Duration::from_millis(18));
+        thread::sleep(Duration::from_millis(16));
     }
     // effect name stamp
     let tag = format!("— {effect} —");
     let ex = scr.cols.saturating_sub(tag.len()) / 2;
-    for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + 4, ch, 3); }
+    for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + block_h + 3, ch, 3); }
     scr.present(palette);
     thread::sleep(Duration::from_millis(900));
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str) -> Result<()> {
+fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
-    let level = AudioLevel::start(audio);
+    let state = AudioState::start(audio);
+    // Clamp to the REAL PTY size so we never overflow and scroll.
+    let (cols, rows) = match pty_size() {
+        Some((c, r)) => (cols.min(c), rows.min(r)),
+        None => (cols, rows),
+    };
     let mut scr = Screen::new(cols, rows);
 
     let palette: &[&str] = match effect {
@@ -548,28 +640,30 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
         _ => &["\x1b[97m", "\x1b[92m", "\x1b[32m"], // matrix
     };
 
-    show_intro(&mut scr, palette, byline, effect);
+    show_intro(&mut scr, palette, byline, effect, intro_size);
 
     match effect {
-        "donut" => fx_donut(&mut scr, palette, intensity, &level),
-        "fire" => fx_fire(&mut scr, palette, intensity, &level),
-        "starfield" => fx_starfield(&mut scr, palette, intensity, &level),
-        "life" => fx_life(&mut scr, palette, intensity, &level),
-        "wave" => fx_wave(&mut scr, palette, intensity, &level),
-        "bars" => fx_bars(&mut scr, palette, intensity, &level),
-        _ => fx_matrix(&mut scr, palette, intensity, &level, effect == "rain"),
+        "donut" => fx_donut(&mut scr, palette, intensity, &state),
+        "fire" => fx_fire(&mut scr, palette, intensity, &state),
+        "starfield" => fx_starfield(&mut scr, palette, intensity, &state),
+        "life" => fx_life(&mut scr, palette, intensity, &state),
+        "wave" => fx_wave(&mut scr, palette, intensity, &state),
+        "bars" => fx_bars(&mut scr, palette, intensity, &state),
+        _ => fx_matrix(&mut scr, palette, intensity, &state, effect == "rain"),
     }
 }
 
 // Audio-reactive pacing: more sound => faster flow (lower delay), smoothly.
-fn frame_delay(base_ms: i64, intensity: i64, level: &AudioLevel) -> Duration {
+fn frame_delay(base_ms: i64, intensity: i64, audio: &AudioState) -> Duration {
     let base = (base_ms - intensity * 3).clamp(8, 120) as f32;
-    let speed_up = 1.0 + level.get() * 2.5;
+    let speed_up = 1.0 + audio.volume() * 2.5;
     Duration::from_millis((base / speed_up).max(6.0) as u64)
 }
 
-// --- matrix / rain: column rain. Density of new drops scales with audio. ---
-fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel, rain: bool) -> Result<()> {
+// --- matrix / rain: column rain where EACH COLUMN follows its frequency band
+// (rain equalizer, like the node implementation): band energy raises that
+// column's fall speed and brightness. Global spawn density follows volume. ---
+fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState, rain: bool) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let chars: Vec<char> = if rain {
@@ -585,18 +679,21 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLe
     let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(trail_base..trail_base + 12)).collect();
     loop {
         scr.clear();
-        let lv = level.get();
-        let spawn_chance = 0.35 + lv * 0.65; // caudal: more drops with sound
+        let vol = audio.volume();
+        let spawn_chance = 0.35 + vol * 0.65; // caudal: more drops with sound
         for c in 0..cols {
+            let band = audio.band_at(c, cols); // this column's frequency band
             let h = head[c];
             for t in 0..trail[c] {
                 let y = h - t as i32;
                 if y >= 0 && y < rows as i32 {
-                    scr.put(c, y as usize, chars[rng.gen_range(0..chars.len())],
-                        if t == 0 { 1 } else if t < 3 { 2 } else { 3 });
+                    // brightness follows the band energy (rain equalizer)
+                    let tint = if t == 0 { 1 } else if band > 0.55 && t < 3 { 2 } else { 3 };
+                    scr.put(c, y as usize, chars[rng.gen_range(0..chars.len())], tint);
                 }
             }
-            head[c] += speed[c];
+            // fall speed grows with the column's band energy
+            head[c] += speed[c] + (band * 2.0) as i32;
             if head[c] - trail[c] as i32 > rows as i32 {
                 if rng.gen::<f32>() < spawn_chance {
                     head[c] = -(rng.gen_range(0..30));
@@ -608,16 +705,16 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLe
             }
         }
         scr.present(palette);
-        thread::sleep(frame_delay(40, intensity, level));
+        thread::sleep(frame_delay(40, intensity, audio));
     }
 }
 
 // --- wave: layered sine waves scrolling horizontally ---
-fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
+fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     let mut t = 0f32;
     loop {
         scr.clear();
-        let lv = level.get();
+        let lv = audio.volume();
         let (cols, rows) = (scr.cols, scr.rows);
         let cy = rows as f32 / 2.0;
         for layer in 0..3u8 {
@@ -633,26 +730,24 @@ fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLeve
         }
         scr.present(palette);
         t += 0.12 + lv * 0.25;
-        thread::sleep(frame_delay(45, intensity, level));
+        thread::sleep(frame_delay(45, intensity, audio));
     }
 }
 
-// --- bars: equalizer bars. Height follows audio level with per-band noise. ---
-fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bands = 24usize;
+// --- bars: equalizer driven by the REAL per-band spectrum (each bar = one
+// frequency band's energy), smoothed so it follows without flicker. ---
+fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+    let bands = NBANDS;
     let mut heights = vec![0f32; bands];
     loop {
         scr.clear();
-        let lv = level.get();
         let (cols, rows) = (scr.cols, scr.rows);
         let maxh = rows as f32 * 0.9;
         let bw = cols / bands.max(1);
         for b in 0..bands {
-            let band_wave = (0.5 + 0.5 * ((b as f32 * 0.7) + lv * 6.0).sin()).max(0.05);
-            let target = (lv * band_wave + rng.gen::<f32>() * 0.08) * maxh;
-            heights[b] += (target - heights[b]) * 0.35; // smooth, no flicker
+            let energy = audio.band_at(b * (cols / bands.max(1)), cols); // band b
+            let target = (energy * 1.1).min(1.0) * maxh;
+            heights[b] += (target - heights[b]) * 0.4; // smooth attack/release
             let h = heights[b] as usize;
             for y in 0..h.min(rows) {
                 let tint = if y as f32 > h as f32 * 0.7 { 1 } else if y as f32 > h as f32 * 0.4 { 2 } else { 3 };
@@ -662,12 +757,12 @@ fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLeve
             }
         }
         scr.present(palette);
-        thread::sleep(frame_delay(50, intensity, level));
+        thread::sleep(frame_delay(50, intensity, audio));
     }
 }
 
 // --- donut: classic 3D torus, scaled to the grid. Spin speed follows audio. ---
-fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
+fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     let mut a = 0f32;
     let mut e = 1f32;
     let (cols, rows) = (scr.cols, scr.rows);
@@ -679,7 +774,7 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLev
     loop {
         scr.clear();
         for b in zbuf.iter_mut() { *b = 0.0; }
-        let lv = level.get();
+        let lv = audio.volume();
         let mut j = 0f32;
         while j < 6.28 {
             let mut i = 0f32;
@@ -710,19 +805,19 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLev
         let spin = 1.0 + lv * 2.0;
         a += 0.04 * spin;
         e += 0.02 * spin;
-        thread::sleep(frame_delay(45, intensity, level));
+        thread::sleep(frame_delay(45, intensity, audio));
     }
 }
 
 // --- fire: classic doom fire from the bottom row. Height licks with audio. ---
-fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
+fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
     let palette_chars: Vec<char> = " .:-=+*#%@".chars().collect();
     let mut heat = vec![vec![0u8; cols]; rows];
     loop {
-        let lv = level.get();
+        let lv = audio.volume();
         // bottom row: fuel, fanned by the audio level
         let fuel = (28.0 + lv * 8.0 + intensity as f32 * 0.4) as u8;
         for x in 0..cols { heat[rows - 1][x] = fuel.min(36); }
@@ -745,12 +840,12 @@ fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLeve
             }
         }
         scr.present(palette);
-        thread::sleep(frame_delay(45, intensity, level));
+        thread::sleep(frame_delay(45, intensity, audio));
     }
 }
 
 // --- starfield: stars flying outward from the center. Speed follows audio. ---
-fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
+fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -762,7 +857,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, level: &Audi
     )).collect();
     loop {
         scr.clear();
-        let lv = level.get();
+        let lv = audio.volume();
         let speed = (0.006 + intensity as f32 * 0.0012) * (1.0 + lv * 2.2);
         for s in stars.iter_mut() {
             s.2 -= speed;
@@ -776,19 +871,19 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, level: &Audi
             }
         }
         scr.present(palette);
-        thread::sleep(frame_delay(40, intensity, level));
+        thread::sleep(frame_delay(40, intensity, audio));
     }
 }
 
 // --- life: Conway's Game of Life, reseeded on stagnation ---
-fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLevel) -> Result<()> {
+fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
     let mut grid = vec![vec![false; cols]; rows];
     let mut next = vec![vec![false; cols]; rows];
     let mut age = vec![vec![0u8; cols]; rows];
-    let density = 0.18 + level.get() * 0.1;
+    let density = 0.18 + audio.volume() * 0.1;
     for y in 0..rows { for x in 0..cols { grid[y][x] = rng.gen::<f32>() < density; } }
     let mut stagnant = 0u32;
     loop {
@@ -824,12 +919,12 @@ fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, level: &AudioLeve
             stagnant += 1;
             if stagnant > 30 {
                 stagnant = 0;
-                let density = 0.18 + level.get() * 0.1;
+                let density = 0.18 + audio.volume() * 0.1;
                 for y in 0..rows { for x in 0..cols {
                     if rng.gen::<f32>() < density * 0.25 { grid[y][x] = true; }
                 }}
             }
         } else { stagnant = 0; }
-        thread::sleep(frame_delay(70, intensity, level));
+        thread::sleep(frame_delay(70, intensity, audio));
     }
 }

@@ -24,20 +24,16 @@ Panel {
   property string effect: "matrix"
   property var effects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   property int intensity: 5
+  property int introSize: 1
   property string byline: ""
-  property string label: running ? "♪" : "off"
+  property string label: "♪"
 
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
 
-  readonly property bool opened: root.controller && root.controller.visible === true
-  function open() { root.controller.show() }
-  function close() { root.controller.hide() }
-  function toggle() {
-    if (root.opened) { root.close() } else { root.open() }
-  }
+  // NOTE: opened / open / close / toggle / closeForPopoutSwitch are provided
+  // by the qs.Ui.Panel base type — do NOT redeclare them (QML forbids
+  // redefining base properties and the panel then fails to compile).
   function openFromHotkey() { root.open() }
-  property bool popoutSwitchClosing: false
-  function closeForPopoutSwitch() { root.close() }
 
   function refresh() { statusProc.running = true }
 
@@ -46,6 +42,7 @@ Panel {
   function setAudio(v)     { root.audio = v;     write("audio="     + (v ? "1" : "0")); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
+  function setIntroSize(v) { root.introSize = v; write("intro_size=" + v); }
   function setByline(t)    { root.byline = t;    write("byline="    + t); }
   function toggleEffect(e, on) {
     var list = root.effects.slice()
@@ -72,6 +69,7 @@ Panel {
           if (typeof s.effect === "string")   root.effect = s.effect
           if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.intensity === "number") root.intensity = s.intensity
+          if (typeof s.intro_size === "number") root.introSize = s.intro_size
           if (typeof s.byline === "string")   root.byline = s.byline
         } catch (e) {}
       }
@@ -103,9 +101,6 @@ Panel {
       ColumnLayout {
         width: parent.width
         spacing: Style.space(12)
-        // leftPadding/rightPadding handled by the panel content margins
-        anchors.leftMargin: Style.space(16)
-        anchors.rightMargin: Style.space(16)
 
         PanelSectionHeader { text: "AUDIO BACKGROUND" }
 
@@ -114,7 +109,7 @@ Panel {
           spacing: Style.space(10)
           Text {
             text: "Enabled"
-            color: root.bar ? root.bar.foreground : "#fff"
+            color: root.barForeground
             font.family: root.bar ? root.bar.fontFamily : "sans"
             font.pixelSize: Style.font.body
             Layout.fillWidth: true
@@ -130,7 +125,7 @@ Panel {
           spacing: Style.space(10)
           Text {
             text: "React to audio"
-            color: root.bar ? root.bar.foreground : "#fff"
+            color: root.barForeground
             font.family: root.bar ? root.bar.fontFamily : "sans"
             font.pixelSize: Style.font.body
             Layout.fillWidth: true
@@ -169,6 +164,15 @@ Panel {
           minimum: 0; maximum: 10; step: 1; integer: true
           value: root.intensity
           onMoved: function(v) { root.setIntensity(v) }
+        }
+
+        PanelSectionHeader { text: "INTRO TEXT SIZE" }
+        PanelSlider {
+          Layout.fillWidth: true
+          bar: root.bar
+          minimum: 1; maximum: 3; step: 1; integer: true
+          value: root.introSize
+          onMoved: function(v) { root.setIntroSize(v) }
         }
 
         PanelSectionHeader { text: "INTRO BYLINE" }

@@ -850,6 +850,7 @@ dependencies = [
  "glib 0.20.12",
  "gtk4",
  "gtk4-layer-shell",
+ "libc",
  "rand",
  "vte4",
 ]

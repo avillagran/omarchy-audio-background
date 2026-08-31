@@ -7,6 +7,7 @@
 #   write_state.sh effect+fire          (enable effect in the rotation list)
 #   write_state.sh effect-fire          (disable it)
 #   write_state.sh intensity=0..10
+#   write_state.sh intro_size=1..3      (intro title text scale)
 #   write_state.sh byline=Some text     (intro byline; empty = default)
 #   write_state.sh restart              (bump restart counter -> replay intro)
 set -e
@@ -14,7 +15,7 @@ STATE="${HOME}/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-backgr
 mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)
-running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"
+running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="1"
 effects="matrix rain wave bars donut fire starfield life"
 
 if [ -f "$STATE" ]; then
@@ -23,6 +24,7 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"effect"[^,}]*' "$STATE");    [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
   v=$(grep -o '"intensity"[^,}]*' "$STATE"); [ -n "$v" ] && intensity=$(echo "$v" | grep -o '[0-9]*')
   v=$(grep -o '"restart"[^,}]*' "$STATE");   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]*')
+  v=$(grep -o '"intro_size"[^,}]*' "$STATE"); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]*')
   v=$(grep -o '"byline"[^,}]*' "$STATE");    [ -n "$v" ] && byline=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
   v=$(grep -o '"effects"[^]]*\]' "$STATE");  [ -n "$v" ] && effects=$(echo "$v" | sed 's/^"effects"\s*:\s*\[//; s/\]$//' | grep -o '"[a-z]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')
 fi
@@ -32,6 +34,7 @@ case "$arg" in
   running=*)  running=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   audio=*)    audio=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   intensity=*) intensity="${arg#*=}" ;;
+  intro_size=*) intro_size="${arg#*=}" ;;
   effect=*)   effect="${arg#*=}" ;;
   byline=*)   byline="${arg#*=}" ;;
   restart)    restart=$((restart + 1)) ;;
@@ -49,5 +52,5 @@ esac
 # emit JSON array for effects
 arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd, -)
 
-printf '{"running":%s,"audio":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s}\n' \
-  "$running" "$audio" "$effect" "$arr" "$intensity" "$byline" "$restart" > "$STATE"
+printf '{"running":%s,"audio":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s}\n' \
+  "$running" "$audio" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" > "$STATE"

@@ -15,6 +15,7 @@ gio = "0.20"
 glib = "0.20"
 anyhow = "1"
 rand = "0.8"
+libc = "0.2"
 
 [profile.release]
 lto = true
