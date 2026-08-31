@@ -47,6 +47,10 @@ struct Config {
     // shows it). Time each background stays on screen before rotating.
     boot_between: bool,
     rotate_secs: i64,
+    // Canvas text for ttfx effects (they animate text), rendered large as ASCII art. And a
+    // resolution scale: bigger cells => fewer cols/rows => less CPU on old machines.
+    ttfx_text: String,
+    resolution: i64,
 }
 
 impl Default for Config {
@@ -63,6 +67,8 @@ impl Default for Config {
             show_fps: false,
             boot_between: true,
             rotate_secs: 20,
+            ttfx_text: "OMARCHY".into(),
+            resolution: 1,
         }
     }
 }
@@ -106,6 +112,8 @@ fn read_config() -> Config {
     if let Some(v) = json_bool(&text, "show_fps") { cfg.show_fps = v; }
     if let Some(v) = json_bool(&text, "boot_between") { cfg.boot_between = v; }
     if let Some(v) = json_num(&text, "rotate_secs") { cfg.rotate_secs = v; }
+    if let Some(v) = json_str(&text, "ttfx_text") { if !v.trim().is_empty() { cfg.ttfx_text = v; } }
+    if let Some(v) = json_num(&text, "resolution") { cfg.resolution = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -175,11 +183,12 @@ fn main() -> Result<()> {
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
+        let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
         let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
         let show_intro = !args.iter().any(|a| a == "--no-intro");
-        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro);
+        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text);
     }
 
     // Drive a vendored ttfx effect directly (library bridge proof).
@@ -187,7 +196,9 @@ fn main() -> Result<()> {
         let effect = arg_value(&args, "--effect").unwrap_or_else(|| "matrix".into());
         let cols = arg_value(&args, "--cols").and_then(|s| s.parse::<usize>().ok()).unwrap_or(80);
         let rows = arg_value(&args, "--rows").and_then(|s| s.parse::<usize>().ok()).unwrap_or(24);
-        return run_ttfx(&effect, cols, rows);
+        let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
+        let state = AudioState::start(false); // standalone --ttfx: no audio capture
+        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false);
     }
 
     gtk4::init()?;
@@ -385,7 +396,9 @@ fn spawn_layer_for_monitor(
     // panel resolution: GTK applies the monitor scale to point sizes, which on
     // a 4K/scaled display produced a handful of giant characters.
     let scale = monitor.scale_factor().max(1) as f64;
-    let cell_px = (9.0 / scale).max(3.0);
+    // `resolution` scales the cell size: 1 = full-res grid (most CPU), higher =
+    // bigger cells => fewer cols/rows => much less CPU (for old machines).
+    let cell_px = (9.0 / scale * cfg.resolution.clamp(1, 8) as f64).max(3.0);
     let font = gtk4::gdk::pango::FontDescription::from_string(&format!("monospace {cell_px:.0}px"));
     term.set_font(Some(&font));
     term.set_scrollback_lines(0);
@@ -420,6 +433,7 @@ fn spawn_layer_for_monitor(
             "--intensity".into(), cfg.intensity.to_string(),
             "--audio".into(), audio.into(),
             "--byline".into(), byline,
+            "--ttfx-text".into(), cfg.ttfx_text.clone(),
             "--intro-size".into(), cfg.intro_size.to_string(),
             "--cell-aspect".into(), format!("{cell_aspect:.3}"),
             "--show-fps".into(), if cfg.show_fps { "1".into() } else { "0".into() },
@@ -879,52 +893,93 @@ fn is_valid_effect(name: &str) -> bool { DEFAULT_EFFECTS.contains(&name) || is_t
 // Drive a vendored ttfx effect on our Vte PTY, looping so it runs as a continuous
 // background (ttfx effects settle when done; rebuild and replay). Handles PTY resize
 // by rebuilding at the new size. Runs after our ASCII intro (same stdout).
-fn run_ttfx(effect_name: &str, cols: usize, rows: usize) -> Result<()> {
+// Canvas input for ttfx effects: the configured text rendered as centered ASCII art —
+// big enough that the effect animates a real readable word (ttfx effects animate
+// text, so they need real content, not sparse noise).
+fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
+    let t = prep(text);
+    let n = t.chars().count().max(1);
+    // Scale to fill ~70% of the width, capped by ~60% of the height.
+    let ws = ((cols as f64 * 0.7) / (6.0 * n as f64)) as usize;
+    let hs = ((rows as f64 * 0.6) / 5.0) as usize;
+    let scale = ws.min(hs).clamp(1, 40);
+    let gap = scale.max(1);
+    let art = art_prefix(&t, n, scale, gap);
+    let art_h = 5 * scale;
+    let art_w = art_width(&t, scale, gap);
+    let top = rows.saturating_sub(art_h) / 2;
+    let left = cols.saturating_sub(art_w) / 2;
+    let mut canvas = vec![vec![' '; cols]; rows];
+    for (r, line) in art.iter().enumerate() {
+        for (i, ch) in line.chars().enumerate() {
+            if ch != ' ' && top + r < rows && left + i < cols {
+                canvas[top + r][left + i] = ch;
+            }
+        }
+    }
+    canvas.iter().map(|row| row.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+}
+
+// Drive a vendored ttfx effect on our Vte PTY, audio-reactively. The effect runs on
+// a VIRTUAL clock and we pace the frames by the live audio level — loud music
+// advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
+// the music like the hand-rolled effects do. Loops so it runs as a continuous
+// background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool) -> Result<()> {
     use clap::Parser;
+    use std::io::Write;
     use ttfx::engine::ctx::{Clock, EngineCtx};
-    use ttfx::engine::effect::{run_effect, RunOutcome};
     use ttfx::engine::terminal::TerminalConfig;
     use ttfx::utils::rng::Rng;
 
     let (mut cols, mut rows) = settle_pty_size(cols, rows);
+    let fps = 60i64;
+    let frame_secs = 1.0 / fps as f64;
     loop {
+        // Build the effect with default config via the clap parser (like upstream's
+        // --random-effect), then drive it ourselves so we can pace it by audio.
         let mut effect = match ttfx::cli::Cli::try_parse_from(["ttfx", effect_name]) {
             Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
             _ => { eprintln!("unknown ttfx effect: {effect_name}"); return Ok(()); }
         };
-        // Canvas content the effect animates. Keep it nearly EMPTY (a token sparse
-        // dot here and there, just non-blank so the engine accepts it) so the
-        // effect's OWN visuals (rain, fire, beams…) dominate instead of a dense
-        // input pattern. Text-forming effects would want real input, but the
-        // background favors ambient effects.
-        let mut input = String::new();
-        for r in 0..rows {
-            for c in 0..cols { input.push(if (r * 7 + c * 13) % 2003 == 0 { '.' } else { ' ' }); }
-            if r + 1 < rows { input.push('\n'); }
-        }
+        // Canvas = the configured text as centered ASCII art (rebuilt each pass).
+        let input = ttfx_canvas_input(ttfx_text, cols, rows);
         let mut config = TerminalConfig::default();
         config.canvas_width = cols as i64;
         config.canvas_height = rows as i64;
-        config.frame_rate = 60;
-        let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::real()) {
+        config.frame_rate = fps;
+        let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::virtual_with_frame_rate(fps)) {
             Ok(c) => c,
             Err(e) => { eprintln!("ttfx ctx error: {e:?}"); return Ok(()); }
         };
-        match run_effect(effect.as_mut(), &mut ctx, true) {
-            // Settled: brief pause then replay (continuous background).
-            Ok(RunOutcome::Complete) => thread::sleep(Duration::from_millis(400)),
-            Ok(RunOutcome::TerminalResized) => {
-                let (c, r) = settle_pty_size(cols, rows);
-                cols = c; rows = r;
-            }
-            // Interrupted / Terminated / OutputClosed: stop.
-            Ok(_) => return Ok(()),
-            Err(e) => { eprintln!("ttfx run error: {e:?}"); return Ok(()); }
+        if let Err(e) = effect.build(&mut ctx) { eprintln!("ttfx build error: {e:?}"); return Ok(()); }
+
+        // Audio-paced frame loop: with a virtual clock each next_frame() advances the
+        // animation by one tick, so pacing the calls by the live audio level makes the
+        // effect speed up on loud passages / beats and slow down when quiet.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if ctx.terminal.prep_canvas(&mut out).is_err() { return Ok(()); }
+        loop {
+            // Stop if the PTY went away (effect settled / terminal gone).
+            let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
+            if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
+            // Pace by the live audio level: louder => smaller delay => faster animation.
+            let vol = audio.volume().clamp(0.0, 1.0);
+            let speed = 1.0 + vol * 3.0 + if audio_enabled && audio.beat() { 1.5 } else { 0.0 };
+            let speed = if audio_enabled { speed } else { 1.0 };
+            thread::sleep(Duration::from_secs_f64(frame_secs / speed as f64));
         }
+        let _ = ctx.terminal.restore_cursor(&mut out, "\n");
+        // Settled: brief pause, then replay as a continuous background.
+        thread::sleep(Duration::from_millis(400));
+        // Re-check PTY size between passes (resize).
+        let (c2, r2) = settle_pty_size(cols, rows);
+        if (c2, r2) != (cols, rows) { cols = c2; rows = r2; }
     }
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool) -> Result<()> {
+fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
     // Use the REAL PTY size, but WAIT for it to settle first (Vte spawns at 80x24).
@@ -948,7 +1003,7 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
-        run_ttfx(effect, cols, rows);
+        run_ttfx(effect, cols, rows, ttfx_text, &state, audio);
         return Ok(());
     }
 

@@ -19,7 +19,7 @@ mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)
 running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="2"; show_fps="false"
-boot_between="true"; rotate_secs="20"
+boot_between="true"; rotate_secs="20"; ttfx_text="OMARCHY"; resolution="1"
 effects="matrix rain wave bars donut fire starfield life"
 
 if [ -f "$STATE" ]; then
@@ -35,6 +35,8 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"restart"[^,}]*' "$STATE" || true);   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"intro_size"[^,}]*' "$STATE" || true); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"rotate_secs"[^,}]*' "$STATE" || true); [ -n "$v" ] && rotate_secs=$(echo "$v" | grep -o '[0-9]\+')
+  v=$(grep -o '"resolution"[^,}]*' "$STATE" || true); [ -n "$v" ] && resolution=$(echo "$v" | grep -o '[0-9]\+')
+  v=$(grep -o '"ttfx_text":"[^"]*"' "$STATE" || true); [ -n "$v" ] && ttfx_text=$(echo "$v" | sed 's/.*"ttfx_text":"\([^"]*\)".*/\1/')
   v=$(grep -o '"byline"[^,}]*' "$STATE" || true);    [ -n "$v" ] && byline=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
   v=$(grep -o '"effects"[^]]*\]' "$STATE" || true);  [ -n "$v" ] && effects=$(echo "$v" | sed 's/^"effects"\s*:\s*\[//; s/\]$//' | grep -o '"[a-z]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')
 fi
@@ -48,6 +50,8 @@ case "$arg" in
   intensity=*) intensity="${arg#*=}" ;;
   intro_size=*) intro_size="${arg#*=}" ;;
   rotate_secs=*) rotate_secs="${arg#*=}" ;;
+  resolution=*) resolution="${arg#*=}" ;;
+  ttfx_text=*) ttfx_text="${arg#*=}" ;;
   effect=*)   effect="${arg#*=}" ;;
   byline=*)   byline="${arg#*=}" ;;
   restart)    restart=$((restart + 1)) ;;
@@ -65,5 +69,5 @@ esac
 # emit JSON array for effects
 arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd, -)
 
-printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s}\n' \
-  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" > "$STATE"
+printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s,"resolution":%s,"ttfx_text":"%s"}\n' \
+  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$ttfx_text" > "$STATE"

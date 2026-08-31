@@ -28,6 +28,8 @@ Panel {
   property int introSize: 2
   property bool bootBetween: true
   property int rotateSecs: 20
+  property string ttfxText: "OMARCHY"
+  property int resolution: 1
   property string byline: ""
   property string label: "♪"
 
@@ -49,6 +51,8 @@ Panel {
   function setShowFps(v)   { root.showFps = v;   write("show_fps="  + (v ? "1" : "0")); }
   function setBootBetween(v) { root.bootBetween = v; write("boot_between=" + (v ? "1" : "0")); }
   function setRotateSecs(v) { root.rotateSecs = v;  write("rotate_secs=" + v); }
+  function setResolution(v) { root.resolution = v;  write("resolution=" + v); }
+  function setTtfxText(t)  { root.ttfxText = t;    write("ttfx_text=" + t); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
   function setIntroSize(v) {
@@ -103,6 +107,8 @@ Panel {
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
           if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
           if (typeof s.rotate_secs === "number") root.rotateSecs = s.rotate_secs
+          if (typeof s.resolution === "number") root.resolution = s.resolution
+          if (typeof s.ttfx_text === "string" && s.ttfx_text.trim() !== "") root.ttfxText = s.ttfx_text
           if (typeof s.byline === "string")   root.byline = s.byline
         } catch (e) {}
       }
@@ -122,7 +128,7 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(540))
+    contentWidth: panel.fittedContentWidth(Style.space(700))
     // Height must follow the content or the card stays at the default
     // contentHeight (200) and the taller layout overflows below it, leaving
     // most controls rendered on bare desktop with no card behind them.
@@ -264,6 +270,15 @@ Panel {
           }
         }
 
+        PanelSectionHeader { text: "TTFX TEXT" }
+        TextField {
+          Layout.fillWidth: true
+          // Default text the ttfx engine animates; emptying reverts to OMARCHY.
+          text: root.ttfxText
+          placeholderText: "OMARCHY"
+          onEditingFinished: root.setTtfxText(text.trim() === "" ? "OMARCHY" : text)
+        }
+
         PanelSectionHeader { text: "ROTATION" }
 
         RowLayout {
@@ -298,6 +313,16 @@ Panel {
           minimum: 0; maximum: 10; step: 1; integer: true
           value: root.intensity
           onMoved: function(v) { root.setIntensity(v) }
+        }
+
+        PanelSectionHeader { text: "RESOLUTION" }
+        PanelSlider {
+          Layout.fillWidth: true
+          bar: root.bar
+          // 1 = full-res (most CPU); higher = coarser cells = less CPU (old machines).
+          minimum: 1; maximum: 4; step: 1; integer: true
+          value: root.resolution
+          onMoved: function(v) { root.setResolution(v) }
         }
 
         PanelSectionHeader { text: "INTRO TEXT SIZE" }
