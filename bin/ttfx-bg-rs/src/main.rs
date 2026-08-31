@@ -168,6 +168,14 @@ fn main() -> Result<()> {
         return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro);
     }
 
+    // Drive a vendored ttfx effect directly (library bridge proof).
+    if args.iter().any(|a| a == "--ttfx") {
+        let effect = arg_value(&args, "--effect").unwrap_or_else(|| "matrix".into());
+        let cols = arg_value(&args, "--cols").and_then(|s| s.parse::<usize>().ok()).unwrap_or(80);
+        let rows = arg_value(&args, "--rows").and_then(|s| s.parse::<usize>().ok()).unwrap_or(24);
+        return run_ttfx(&effect, cols, rows);
+    }
+
     gtk4::init()?;
     let self_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
@@ -820,6 +828,45 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     scr.fps_overlay();
     scr.present(palette);
     thread::sleep(Duration::from_millis(2600));
+}
+
+// Bridge to the vendored ttfx engine (ttfx-src), used as a LIBRARY. Builds one ttfx
+// effect and drives it on our Vte PTY (the render child's stdout is a tty), so the
+// background can run ttfx's effects in-process instead of shelling out to a separate
+// ttfx binary. First integration step: proves the bridge. Audio-reactive drive and
+// mapping the whole catalog come next.
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize) -> Result<()> {
+    use clap::Parser;
+    use ttfx::engine::ctx::{Clock, EngineCtx};
+    use ttfx::engine::terminal::TerminalConfig;
+    use ttfx::utils::rng::Rng;
+
+    let mut effect = match ttfx::cli::Cli::try_parse_from(["ttfx", effect_name]) {
+        Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
+        _ => { eprintln!("unknown ttfx effect: {effect_name}"); return Ok(()); }
+    };
+
+    // Canvas content the effect animates — a screenful sized to our grid (kept
+    // non-blank so the engine accepts it).
+    let mut input = String::new();
+    for r in 0..rows {
+        for c in 0..cols { input.push(if (r + c) % 7 == 0 { '.' } else { ' ' }); }
+        if r + 1 < rows { input.push('\n'); }
+    }
+
+    let mut config = TerminalConfig::default();
+    config.canvas_width = cols as i64;
+    config.canvas_height = rows as i64;
+    config.frame_rate = 60;
+
+    let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::real()) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("ttfx ctx error: {e:?}"); return Ok(()); }
+    };
+    if let Err(e) = ttfx::engine::effect::run_effect(effect.as_mut(), &mut ctx, true) {
+        eprintln!("ttfx run error: {e:?}");
+    }
+    Ok(())
 }
 
 fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool) -> Result<()> {

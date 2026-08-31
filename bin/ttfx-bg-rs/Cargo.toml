@@ -16,6 +16,11 @@ glib = "0.20"
 anyhow = "1"
 rand = "0.8"
 libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+# ttfx effects engine, vendored as a git submodule (ttfx-src/). Used as a LIBRARY
+# so the background can drive ttfx's effects in-process (and, later, feed them the
+# audio levels) instead of shelling out to a separate ttfx binary.
+ttfx = { path = "../../ttfx-src" }
 
 [profile.release]
 lto = true
