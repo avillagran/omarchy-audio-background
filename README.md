@@ -111,19 +111,28 @@ can be updated from upstream:
 
 ## Install / enable the plugin
 
-Local plugins are installed by **symlink** (Omarchy discovers
-`~/.config/omarchy/plugins/<id>`), then enabled:
+Install from this repository with the Omarchy CLI (it clones into
+`~/.config/omarchy/plugins/<id>` automatically — no manual symlink needed):
 
 ```sh
-ln -sfn /home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background \
-       ~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background
-omarchy plugin enable io.github.avillagran.omarchy-ttfx-background --section right
-omarchy-shell shell rescanPlugins   # if the plugin is not yet known
+omarchy plugin add https://github.com/avillagran/omarchy-ttfx-background.git --enable --yes
 ```
 
-(`omarchy plugin add` is git-only and won't accept a local path.) After enabling,
-restart the shell (`omarchy-restart-shell`) so the `service` / `panel` kinds load.
-Left-click the bar widget to open the config panel.
+If the plugin is already on disk but the shell hasn't picked it up, force a reload:
+
+```sh
+omarchy-shell shell rescanPlugins
+```
+
+After enabling, restart the shell (`omarchy-restart-shell`) so the `service` / `panel`
+kinds load. Left-click the bar widget to open the config panel.
+
+> For local development you can symlink your working copy into the plugins dir:
+> ```sh
+> ln -sfn "$PWD" ~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background
+> ```
+> (run from the repo root, so `$PWD` resolves to your checkout — never hardcode a
+> user home path).
 
 ## Notes / limitations
 
