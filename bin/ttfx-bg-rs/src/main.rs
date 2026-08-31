@@ -195,7 +195,14 @@ fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str, cfg: &Config)
     window.set_exclusive_zone(-1);
 
     let term = vte4::Terminal::new();
-    let font = gtk4::gdk::pango::FontDescription::from_string("monospace 14");
+    // Use a font size in *physical pixels* (not points) so the glyph grid
+    // scales with the panel's resolution: on a 4K / scaled display a point
+    // size gets inflated by the monitor scale factor and you get a handful of
+    // giant characters. GTK applies the monitor scale to the font, so we
+    // divide by it to keep a consistent on-screen cell size (~9px) everywhere.
+    let scale = monitor.scale_factor().max(1) as f64;
+    let cell_px = (9.0 / scale).max(3.0);
+    let font = gtk4::gdk::pango::FontDescription::from_string(&format!("monospace {cell_px:.0}px"));
     term.set_font(Some(&font));
     term.set_scrollback_lines(0);
     term.set_hexpand(true);
@@ -206,8 +213,19 @@ fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str, cfg: &Config)
     // skip the renderer. Otherwise spawn the effect renderer sized to fit.
     if cfg.running {
         let geo = monitor.geometry();
-        let cols = ((geo.width() as f64) / 8.4).floor().max(80.0) as usize;
-        let rows = ((geo.height() as f64) / 17.0).floor().max(24.0) as usize;
+        // Measure the real cell size from the font (robust regardless of
+        // DPI / scale factor). Vte cells are monospace: width = advance of a
+        // glyph, height = font line height.
+        let font_size = font.size() as f64 / gtk4::pango::SCALE as f64;
+        let ctx = term.pango_context();
+        let metrics = ctx.metrics(Some(&font), None);
+        let char_w = metrics.approximate_char_width() as f64 / gtk4::pango::SCALE as f64;
+        let ascent = metrics.ascent() as f64 / gtk4::pango::SCALE as f64;
+        let descent = metrics.descent() as f64 / gtk4::pango::SCALE as f64;
+        let cw = if char_w > 0.0 { char_w } else { font_size * 0.6 };
+        let ch = if (ascent + descent) > 0.0 { ascent + descent } else { font_size * 1.2 };
+        let cols = ((geo.width() as f64) / cw).floor().max(80.0) as usize;
+        let rows = ((geo.height() as f64) / ch).floor().max(24.0) as usize;
         let effect = cfg.effect.clone();
         let intensity = cfg.intensity;
         let cmd = format!("{self_bin} --matrix {cols} {rows} --effect {effect} --intensity {intensity}");
