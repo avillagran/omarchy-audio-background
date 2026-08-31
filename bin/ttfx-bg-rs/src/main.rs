@@ -51,6 +51,9 @@ struct Config {
     // resolution scale: bigger cells => fewer cols/rows => less CPU on old machines.
     ttfx_text: String,
     resolution: i64,
+    // How strongly ttfx effects react to audio: slider 0..5 (0 = off, 2 = normal, 5 =
+    // strong). Scales the frame-pacing speed boost driven by the live volume/beat.
+    reactivity: i64,
 }
 
 impl Default for Config {
@@ -69,6 +72,7 @@ impl Default for Config {
             rotate_secs: 20,
             ttfx_text: "OMARCHY".into(),
             resolution: 1,
+            reactivity: 2,
         }
     }
 }
@@ -114,6 +118,7 @@ fn read_config() -> Config {
     if let Some(v) = json_num(&text, "rotate_secs") { cfg.rotate_secs = v; }
     if let Some(v) = json_str(&text, "ttfx_text") { if !v.trim().is_empty() { cfg.ttfx_text = v; } }
     if let Some(v) = json_num(&text, "resolution") { cfg.resolution = v; }
+    if let Some(v) = json_num(&text, "reactivity") { cfg.reactivity = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -184,11 +189,12 @@ fn main() -> Result<()> {
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
+        let reactivity = arg_value(&args, "--reactivity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
         let show_intro = !args.iter().any(|a| a == "--no-intro");
-        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text);
+        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text, reactivity);
     }
 
     // Drive a vendored ttfx effect directly (library bridge proof).
@@ -197,8 +203,9 @@ fn main() -> Result<()> {
         let cols = arg_value(&args, "--cols").and_then(|s| s.parse::<usize>().ok()).unwrap_or(80);
         let rows = arg_value(&args, "--rows").and_then(|s| s.parse::<usize>().ok()).unwrap_or(24);
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
+        let reactivity = arg_value(&args, "--reactivity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let state = AudioState::start(false); // standalone --ttfx: no audio capture
-        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false);
+        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity);
     }
 
     gtk4::init()?;
@@ -434,6 +441,7 @@ fn spawn_layer_for_monitor(
             "--audio".into(), audio.into(),
             "--byline".into(), byline,
             "--ttfx-text".into(), cfg.ttfx_text.clone(),
+            "--reactivity".into(), cfg.reactivity.to_string(),
             "--intro-size".into(), cfg.intro_size.to_string(),
             "--cell-aspect".into(), format!("{cell_aspect:.3}"),
             "--show-fps".into(), if cfg.show_fps { "1".into() } else { "0".into() },
@@ -925,7 +933,7 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
 // advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
 // the music like the hand-rolled effects do. Loops so it runs as a continuous
 // background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
-fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool) -> Result<()> {
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, reactivity: i64) -> Result<()> {
     use clap::Parser;
     use std::io::Write;
     use ttfx::engine::ctx::{Clock, EngineCtx};
@@ -964,10 +972,11 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             // Stop if the PTY went away (effect settled / terminal gone).
             let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
             if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
-            // Pace by the live audio level: louder => smaller delay => faster animation.
+            // Pace by the live audio level, scaled by the user's reactivity setting:
+            // louder => smaller delay => faster animation. reactivity 0 disables it.
             let vol = audio.volume().clamp(0.0, 1.0);
-            let speed = 1.0 + vol * 3.0 + if audio_enabled && audio.beat() { 1.5 } else { 0.0 };
-            let speed = if audio_enabled { speed } else { 1.0 };
+            let boost = (vol * 3.0 + if audio.beat() { 1.5 } else { 0.0 }) * (reactivity as f32 / 2.0);
+            let speed = if audio_enabled && reactivity > 0 { 1.0 + boost } else { 1.0 };
             thread::sleep(Duration::from_secs_f64(frame_secs / speed as f64));
         }
         let _ = ctx.terminal.restore_cursor(&mut out, "\n");
@@ -979,7 +988,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     }
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str) -> Result<()> {
+fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str, reactivity: i64) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
     // Use the REAL PTY size, but WAIT for it to settle first (Vte spawns at 80x24).
@@ -1003,7 +1012,7 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
-        run_ttfx(effect, cols, rows, ttfx_text, &state, audio);
+        run_ttfx(effect, cols, rows, ttfx_text, &state, audio, reactivity);
         return Ok(());
     }
 

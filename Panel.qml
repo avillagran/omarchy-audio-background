@@ -30,6 +30,7 @@ Panel {
   property int rotateSecs: 20
   property string ttfxText: "OMARCHY"
   property int resolution: 1
+  property int reactivity: 2
   property string byline: ""
   property string label: "♪"
 
@@ -52,6 +53,7 @@ Panel {
   function setBootBetween(v) { root.bootBetween = v; write("boot_between=" + (v ? "1" : "0")); }
   function setRotateSecs(v) { root.rotateSecs = v;  write("rotate_secs=" + v); }
   function setResolution(v) { root.resolution = v;  write("resolution=" + v); }
+  function setReactivity(v) { root.reactivity = v;  write("reactivity=" + v); }
   function setTtfxText(t)  { root.ttfxText = t;    write("ttfx_text=" + t); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
@@ -108,6 +110,7 @@ Panel {
           if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
           if (typeof s.rotate_secs === "number") root.rotateSecs = s.rotate_secs
           if (typeof s.resolution === "number") root.resolution = s.resolution
+          if (typeof s.reactivity === "number") root.reactivity = s.reactivity
           if (typeof s.ttfx_text === "string" && s.ttfx_text.trim() !== "") root.ttfxText = s.ttfx_text
           if (typeof s.byline === "string")   root.byline = s.byline
         } catch (e) {}
@@ -323,6 +326,16 @@ Panel {
           minimum: 1; maximum: 4; step: 1; integer: true
           value: root.resolution
           onMoved: function(v) { root.setResolution(v) }
+        }
+
+        PanelSectionHeader { text: "AUDIO REACTIVITY" }
+        PanelSlider {
+          Layout.fillWidth: true
+          bar: root.bar
+          // How strongly ttfx effects speed up with the music. 0 = off, 2 = normal, 5 = strong.
+          minimum: 0; maximum: 5; step: 1; integer: true
+          value: root.reactivity
+          onMoved: function(v) { root.setReactivity(v) }
         }
 
         PanelSectionHeader { text: "INTRO TEXT SIZE" }
