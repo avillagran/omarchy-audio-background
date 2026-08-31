@@ -60,22 +60,14 @@ BarWidget {
     onLoaded: { root.injectPanel(); Qt.callLater(root.injectPanel) }
   }
 
-  // Icon (music note over rectangle) + live state label.
-  implicitWidth: row.implicitWidth
-  implicitHeight: row.implicitHeight
-  RowLayout {
-    id: row
-    spacing: 5
-    Image {
-      source: "file://" + root.iconPath
-      sourceSize.width: 16; sourceSize.height: 16
-      fillMode: Image.PreserveAspectFit
-    }
-    Text {
-      text: root.running ? root.effect : "off"
-      color: root.running ? "#00ffea" : "#888"
-      font.pixelSize: 12
-    }
+  // Icon (music note over rectangle). Click opens the config panel.
+  implicitWidth: icon.implicitWidth
+  implicitHeight: icon.implicitHeight
+  Image {
+    id: icon
+    source: "file://" + root.iconPath
+    sourceSize.width: 16; sourceSize.height: 16
+    fillMode: Image.PreserveAspectFit
   }
 
   MouseArea {
