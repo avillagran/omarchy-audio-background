@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Logs
+*.log

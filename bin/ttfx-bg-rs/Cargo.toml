@@ -1,0 +1,21 @@
+[package]
+name = "ttfx-bg-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ttfx-bg-rs"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = "0.10"
+gtk4-layer-shell = "0.6"
+vte4 = "0.9"
+gio = "0.20"
+glib = "0.20"
+anyhow = "1"
+rand = "0.8"
+
+[profile.release]
+lto = true
+strip = true

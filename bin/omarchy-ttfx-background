@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Launcher/controller for the omarchy ttfx audio-reactive background.
+# Invoked by the Quickshell BarWidget plugin (omarchy-ttfx-background).
+#
+#   bin/omarchy-ttfx-background start <effect>   # launch background (ttfx + reactive meter)
+#   bin/omarchy-ttfx-background stop             # kill background
+#   bin/omarchy-ttfx-background status           # print running effects / pids
+#   bin/omarchy-ttfx-background effects          # list available ttfx effects
+#
+# Two transparent fullscreen foot terminals are spawned:
+#   - ttfx-bg:    runs `ttfx <effect>` (Rust/.NET terminal text effect) as the living layer.
+#   - ttfx-meter: runs `medidor.py` (stdlib) drawing the reactive spectrum on top.
+#
+# IMPORTANT notes discovered on this box (Omarchy / Hyprland 0.56, "sensei" Lua API):
+#   * ttfx prints "NO INPUT." and EXITS if it gets no stdin. We must pipe a label in.
+#   * Only `matrix` loops forever by recycling its input; most effects animate the
+#     given text once and then EXIT (the window closes). The reactive feel comes from
+#     the medidor.py spectrum, not from ttfx itself.
+#   * hyprctl `keyword` is disabled here; window ops use the sensei form
+#     `hyprctl dispatch "hl.dsp.window.<op>({ window = \"address:..\" })"`.
+#   * A window must be FLOATING before it can be PINNED ("does not qualify to be pinned"
+#     otherwise). Fullscreen via the API needs the window focused, so we launch foot
+#     with -F (true fullscreen) which also makes it floating, and then attempt pin.
+#   * Layer-shell panels (omarchy bar) render ABOVE fullscreen/pinned windows.
+#   * The shell's HYPRLAND_INSTANCE_SIGNATURE can be stale; we auto-detect the live
+#     instance so hyprctl actually reaches the socket.
+set -u
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PIDFILE="/tmp/ttfx_bg_pids"
+
+# Monitor source: resolve the MONITOR of the default sink dynamically. On this box
+# the default sink is an effect sink (audio_effect.j416-convolver), so a hardcoded
+# headphones monitor would capture silence. Override with TTFX_MONITOR if needed.
+resolve_monitor() {
+  if [ -n "${TTFX_MONITOR:-}" ]; then echo "$TTFX_MONITOR"; return; fi
+  local sink
+  sink="$(pactl get-default-sink 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$sink" ]; then echo "${sink}.monitor"; return; fi
+  echo "alsa_output.platform-sound.HiFi__Headphones__sink.monitor"
+}
+MONITOR="$(resolve_monitor)"
+# Label fed to ttfx so it has glyphs to animate (whitespace-only -> "NO INPUT.").
+TTFX_TEXT="${TTFX_TEXT:-OMARCHY}"
+# Foot alpha for the BACKGROUND window: 1.0 = opaque (the ttfx animation fills the
+# whole screen, wallpaper hidden). Set TTFX_ALPHA=0.0 for a transparent overlay that
+# lets the wallpaper show through behind the glyphs.
+FOOT_ALPHA="${TTFX_ALPHA:-1.0}"
+
+EFFECTS="matrix rain decrypt beams colorshift spotlights synthgrid scattered unstable fireworks thunderstorm waves burn crumble blackhole bubbles bouncyballs binarypath rings slice spray swarm sweep vhstape smoke pour print highlight laseretch middleout orbittingvolley overflow randomsequence errorcorrect expand wipe slide"
+
+# --- find the live Hyprland instance so hyprctl reaches the socket ---------------
+live_signature() {
+  # Prefer the env var if its socket actually exists.
+  local sig="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+  if [ -n "$sig" ] && [ -S "/run/user/$(id -u)/hypr/$sig/.socket.sock" ]; then
+    echo "$sig"; return 0
+  fi
+  # Otherwise pick whichever instance dir under /run/user/UID/hypr has .socket.sock.
+  local d best=""
+  for d in /run/user/$(id -u)/hypr/*/; do
+    if [ -S "${d}.socket.sock" ]; then best="${d%/}"; best="${best##*/}"; break; fi
+  done
+  echo "$best"
+}
+
+# Run hyprctl with the live instance signature.
+hyperctl() {
+  local sig; sig="$(live_signature)"
+  if [ -n "$sig" ]; then
+    HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl "$@"
+  else
+    hyprctl "$@"
+  fi
+}
+
+# Apply float -> pin -> zorder to a window addressed by its app-id (class).
+style_window() {
+  local class="$1" zmode="${2:-top}"
+  local addr; addr="$(hyperctl clients -j 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    d=[]
+for c in d:
+    if str(c.get('class','')).lower()=='$class':
+        print(c.get('address','')); break
+" 2>/dev/null)"
+  [ -z "$addr" ] && return 0
+  # float first so pin qualifies, then pin, then raise/lower zorder.
+  hyperctl dispatch "hl.dsp.window.float({ window = \"address:$addr\", action = \"toggle\" })" >/dev/null 2>&1
+  sleep 0.2
+  hyperctl dispatch "hl.dsp.window.pin({ window = \"address:$addr\" })" >/dev/null 2>&1
+  hyperctl dispatch "hl.dsp.window.alter_zorder({ window = \"address:$addr\", mode = \"$zmode\" })" >/dev/null 2>&1
+}
+
+# Kill any ttfx/foot windows we spawned, addressed by app-id (robust against a
+# missing/orphaned PIDFILE). Uses the sensei close dispatcher per live window.
+kill_windows_by_appid() {
+  local class addr
+  for class in ttfx-bg ttfx-meter; do
+    addr="$(hyperctl clients -j 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    d=[]
+for c in d:
+    if str(c.get('class','')).lower()=='$class':
+        print(c.get('address','')); break
+" 2>/dev/null)"
+    [ -z "$addr" ] && continue
+    hyperctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1
+  done
+  # belt-and-suspenders: kill any lingering foot/medidor procs by app-id
+  pkill -f "app-id ttfx-bg" 2>/dev/null
+  pkill -f "app-id ttfx-meter" 2>/dev/null
+  pkill -f "medidor.py" 2>/dev/null
+}
+
+has_windows() {
+  [ -n "$(hyperctl clients -j 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    d=[]
+print('1' if any('ttfx' in str(c.get('class','')).lower() for c in d) else '')
+" 2>/dev/null)" ]
+}
+
+is_running() {
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cut -d' ' -f1 "$PIDFILE")" 2>/dev/null; then
+    return 0
+  fi
+  # PIDFILE missing/stale but windows still alive -> treat as running for safety.
+  has_windows
+}
+
+start() {
+  local eff="${1:-matrix}"
+  if is_running; then
+    echo "already running; stopping first to restart with effect=$eff"
+    stop
+    sleep 0.5
+  fi
+
+  # 1) LIVING LAYER: fullscreen reactive visualizer (stdlib). This replaces ttfx as the
+  #    background: ttfx only animates on an interactive TTY and emits NOTHING via a pipe
+  #    (verified: 0 bytes), so it cannot serve as a continuous background here. The
+  #    visualizer reads the monitor, computes the spectrum with analyzer_light.Analyzer,
+  #    and draws a large animated equalizer that reacts to real audio — continuously.
+  #    Launched with -F (true fullscreen). foot resets its pty to 80x24 on the
+  #    fullscreen resize event, so we wait briefly then force a large grid with `stty`
+  #    (no further resize fires) so the spectrum fills the whole screen. We must NOT
+  #    float/pin the bg (float would un-fullscreen it).
+  TTFX_MONITOR="$MONITOR" TTFX_EFFECT="$eff" TTFX_TEXT="$TTFX_TEXT" \
+    setsid foot -F --app-id ttfx-bg \
+      -o "colors.alpha=$FOOT_ALPHA" -o "colors.background=000000" \
+      -o "font.size=3" \
+      -e sh -c "sleep 0.6; stty rows 420 cols 1100; exec python3 \"$DIR/visualizer.py\"" >/dev/null 2>&1 &
+  local pid_bg=$!
+
+  # 2) Optional compact overlay meter (also reactive). OFF by default because the
+  #    fullscreen visualizer already fills the background reactively. Enable with
+  #    TTFX_METER=1.
+  local pid_meter=""
+  if [[ "${TTFX_METER:-0}" == "1" ]]; then
+    TTFX_MONITOR="$MONITOR" TTFX_EFFECT="$eff" TTFX_TEXT="$TTFX_TEXT" \
+      setsid foot --app-id ttfx-meter -w 440x1000 \
+        -o "colors.alpha=$FOOT_ALPHA" -o "colors.background=000000" \
+        -e python3 "$DIR/medidor.py" >/dev/null 2>&1 &
+    pid_meter=$!
+  fi
+
+  echo "$pid_bg $pid_meter $eff" > "$PIDFILE"
+
+  # The bg is launched with -F (true fullscreen) and we must NOT float/pin it.
+  # Only style the optional meter (floating + pinned on top) if it was launched.
+  sleep 1.5
+  if [[ -n "$pid_meter" ]]; then
+    style_window "ttfx-meter" "top"
+  fi
+
+  echo "started effect=$eff bg=$pid_bg meter=$pid_meter (alpha=$FOOT_ALPHA)"
+}
+
+stop() {
+  if [[ -f "$PIDFILE" ]]; then
+    local pids; pids="$(cat "$PIDFILE")"
+    for p in $pids; do kill "$p" 2>/dev/null; done
+    rm -f "$PIDFILE"
+  fi
+  # Always clean up any spawned windows/procs, even if PIDFILE was missing.
+  kill_windows_by_appid
+  echo "stopped"
+}
+
+status() {
+  if is_running; then
+    if [[ -f "$PIDFILE" ]]; then echo "RUNNING: $(cat "$PIDFILE")"
+    else echo "RUNNING (orphaned windows, no pidfile) — run 'stop' to clean up"; fi
+  else
+    echo "STOPPED"
+  fi
+}
+
+case "${1:-status}" in
+  start) start "${2:-matrix}" ;;
+  stop)  stop ;;
+  status) status ;;
+  effects) echo "$EFFECTS" ;;
+  *) echo "usage: $0 {start <effect>|stop|status|effects}"; exit 1 ;;
+esac
