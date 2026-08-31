@@ -18,10 +18,60 @@ use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use std::cell::RefCell;
 use std::io::Write;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 use vte4::{TerminalExt, TerminalExtManual};
+
+#[derive(Clone, Default)]
+struct Config {
+    running: bool,
+    effect: String,
+    intensity: i64,
+}
+
+fn config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home)
+        .join(".config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json")
+}
+
+// Best-effort read of the panel's state.json. Missing/invalid => defaults.
+// Tolerant of both pretty-printed and single-line (compact) JSON.
+// NOTE: use independent `if`s (not `else if`) — a compact line carries all
+// three keys at once, and `else if` would only parse the first match.
+fn read_config() -> Config {
+    let mut cfg = Config { running: true, effect: "matrix".into(), intensity: 5 };
+    if let Ok(text) = std::fs::read_to_string(config_path()) {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.split_once("\"running\"") {
+                if let Some(v) = rest.1.split(':').nth(1) {
+                    cfg.running = v
+                        .trim_matches(|c| c == ' ' || c == ',' || c == '"' || c == '}' || c == ']' || c == '{')
+                        .starts_with('t');
+                }
+            }
+            if let Some(rest) = line.split_once("\"effect\"") {
+                if let Some(v) = rest.1.split(':').nth(1) {
+                    // Value is "...","next":... — take the text between the
+                    // first pair of quotes, so we get just the effect name.
+                    if let Some(e) = v.split('"').nth(1) {
+                        cfg.effect = e.to_string();
+                    }
+                }
+            }
+            if let Some(rest) = line.split_once("\"intensity\"") {
+                if let Some(v) = rest.1.split(':').nth(1) {
+                    let s = v.trim_matches(|c| c == ' ' || c == ',' || c == '"' || c == '}' || c == ']');
+                    if let Ok(n) = s.parse::<i64>() { cfg.intensity = n; }
+                }
+            }
+        }
+    }
+    cfg
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -31,7 +81,11 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--matrix") {
         let cols = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
         let rows = args.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
-        return run_matrix(cols, rows);
+        let effect = arg_value(&args, "--effect").unwrap_or_else(|| "matrix".into());
+        let intensity = arg_value(&args, "--intensity")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(5);
+        return run_matrix(cols, rows, &effect, intensity);
     }
 
     gtk4::init()?;
@@ -40,20 +94,47 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "ttfx-bg-rs".into());
 
     // Track the per-monitor layers so we can tear them down and rebuild them
-    // whenever the monitor set or any resolution changes.
+    // whenever the monitor set, resolution, or panel config changes.
     let windows: Rc<RefCell<Vec<gtk4::ApplicationWindow>>> = Rc::new(RefCell::new(Vec::new()));
-    rebuild_layers(&windows, &self_bin);
+    let last_cfg: Rc<RefCell<Config>> = Rc::new(RefCell::new(read_config()));
+
+    rebuild_layers(&windows, &self_bin, &last_cfg.borrow());
 
     // The Gdk monitor list is a ListModel; it emits `items-changed` when a
     // monitor is added/removed AND when Hyprland re-adds a monitor on a
     // resolution change. Rebuild so every layer matches the new geometry.
+    // Read fresh config here: monitor events fire often, and using a cached
+    // config would clobber a panel change made in between rebuilds.
     if let Some(display) = gdk::Display::default() {
         let monitors = display.monitors();
         let w = windows.clone();
         let b = self_bin.clone();
+        let lc = last_cfg.clone();
         monitors.connect_items_changed(move |_, _pos, _removed, _added| {
             println!("monitors changed — rebuilding background layers");
-            rebuild_layers(&w, &b);
+            let cfg = read_config();
+            *lc.borrow_mut() = cfg.clone();
+            rebuild_layers(&w, &b, &cfg);
+        });
+    }
+
+    // Poll the panel's state.json; if running/effect/intensity changed, rebuild.
+    {
+        let w = windows.clone();
+        let b = self_bin.clone();
+        let lc = last_cfg.clone();
+        glib::timeout_add_local(Duration::from_millis(700), move || {
+            let cfg = read_config();
+            let changed = {
+                let old = lc.borrow();
+                old.running != cfg.running || old.effect != cfg.effect || old.intensity != cfg.intensity
+            };
+            if changed {
+                println!("config changed — rebuilding background layers");
+                *lc.borrow_mut() = cfg.clone();
+                rebuild_layers(&w, &b, &cfg);
+            }
+            glib::ControlFlow::Continue
         });
     }
 
@@ -61,7 +142,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn rebuild_layers(windows: &Rc<RefCell<Vec<gtk4::ApplicationWindow>>>, self_bin: &str) {
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == key {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix(&format!("{key}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn rebuild_layers(windows: &Rc<RefCell<Vec<gtk4::ApplicationWindow>>>, self_bin: &str, cfg: &Config) {
+    // Kill any renderer subprocesses from a previous build. The pattern
+    // `--matrix` only matches the child renderers, never this parent binary,
+    // so pkill won't take us down with them.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "ttfx-bg-rs --matrix"])
+        .output();
     for w in windows.borrow_mut().drain(..) {
         w.close();
     }
@@ -71,16 +171,16 @@ fn rebuild_layers(windows: &Rc<RefCell<Vec<gtk4::ApplicationWindow>>>, self_bin:
     };
     let monitors = display.monitors();
     let n = monitors.n_items();
-    println!("found {n} monitor(s)");
+    println!("found {n} monitor(s), running={}", cfg.running);
     for i in 0..n {
         if let Some(monitor) = monitors.item(i).and_downcast::<gdk::Monitor>() {
-            let w = spawn_layer_for_monitor(&monitor, self_bin);
+            let w = spawn_layer_for_monitor(&monitor, self_bin, cfg);
             windows.borrow_mut().push(w);
         }
     }
 }
 
-fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str) -> gtk4::ApplicationWindow {
+fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str, cfg: &Config) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder()
         .title("ttfx-bg")
         .build();
@@ -93,8 +193,6 @@ fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str) -> gtk4::Appl
         window.set_anchor(e, true);
     }
     window.set_exclusive_zone(-1);
-    let geo = monitor.geometry();
-    window.set_default_size(geo.width(), geo.height());
 
     let term = vte4::Terminal::new();
     let font = gtk4::gdk::pango::FontDescription::from_string("monospace 14");
@@ -104,28 +202,33 @@ fn spawn_layer_for_monitor(monitor: &gdk::Monitor, self_bin: &str) -> gtk4::Appl
     term.set_vexpand(true);
     window.set_child(Some(&term));
 
-    // Compute the terminal grid size from the monitor geometry and the fixed
-    // font, and spawn the renderer immediately. We don't wait on a timeout:
-    // a monitor change rebuilds the layers and would close this window before
-    // a deferred spawn could run, leaving a screen without its renderer.
-    let geo = monitor.geometry();
-    let cols = ((geo.width() as f64) / 8.4).floor().max(80.0) as usize;
-    let rows = ((geo.height() as f64) / 17.0).floor().max(24.0) as usize;
-    let cmd = format!("{self_bin} --matrix {cols} {rows}");
-    term.spawn_async(
-        vte4::PtyFlags::DEFAULT,
-        None,
-        &["sh", "-c", &cmd],
-        &[],
-        gtk4::glib::SpawnFlags::empty(),
-        || {},
-        2000,
-        None::<&gtk4::gio::Cancellable>,
-        move |res| match res {
-            Ok(_) => println!("matrix renderer spawned ({cols}x{rows})"),
-            Err(e) => eprintln!("spawn error: {e:?}"),
-        },
-    );
+    // If the panel turned the background off, show an empty (black) layer and
+    // skip the renderer. Otherwise spawn the effect renderer sized to fit.
+    if cfg.running {
+        let geo = monitor.geometry();
+        let cols = ((geo.width() as f64) / 8.4).floor().max(80.0) as usize;
+        let rows = ((geo.height() as f64) / 17.0).floor().max(24.0) as usize;
+        let effect = cfg.effect.clone();
+        let intensity = cfg.intensity;
+        let cmd = format!("{self_bin} --matrix {cols} {rows} --effect {effect} --intensity {intensity}");
+        // Pre-clear the terminal so Vte doesn't flash its "N by M cells"
+        // placeholder while the renderer's PTY is still connecting.
+        term.feed(b"\x1b[2J\x1b[H\x1b[40m");
+        term.spawn_async(
+            vte4::PtyFlags::DEFAULT,
+            None,
+            &["sh", "-c", &cmd],
+            &[],
+            gtk4::glib::SpawnFlags::empty(),
+            || {},
+            2000,
+            None::<&gtk4::gio::Cancellable>,
+            move |res| match res {
+                Ok(_) => println!("renderer spawned ({cols}x{rows}, effect={effect}, intensity={intensity})"),
+                Err(e) => eprintln!("spawn error: {e:?}"),
+            },
+        );
+    }
 
     window.present();
     window
@@ -192,13 +295,30 @@ fn run_donut() -> Result<()> {
 }
 
 // Matrix rain drawn in Rust (real background, animates inside Vte).
-fn run_matrix(cols: usize, rows: usize) -> Result<()> {
+// `effect` selects a color scheme; `intensity` (0-10) scales speed/trail.
+// TODO(Step 1): replace with the vendored ttfx engine effects.
+fn run_matrix(cols: usize, rows: usize, effect: &str, intensity: i64) -> Result<()> {
     use rand::Rng;
+    let intensity = intensity.clamp(0, 10);
+    let speed_base: i32 = 1 + (intensity / 4) as i32;
+    let trail_base: usize = 8 + (intensity as usize) * 2;
+    let head_color: &str = match effect {
+        "rain" => "\x1b[96m",
+        "wave" => "\x1b[95m",
+        "bars" => "\x1b[93m",
+        _ => "\x1b[97m", // matrix
+    };
+    let trail_alt: &str = match effect {
+        "rain" => "\x1b[36m",
+        "wave" => "\x1b[35m",
+        "bars" => "\x1b[33m",
+        _ => "\x1b[32m",
+    };
     let mut rng = rand::thread_rng();
     let chars: Vec<char> = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789ABCDEF".chars().collect();
     let mut head: Vec<i32> = (0..cols).map(|_| rng.gen_range(0..rows as i32)).collect();
-    let mut speed: Vec<i32> = (0..cols).map(|_| rng.gen_range(1..3)).collect();
-    let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(8..24)).collect();
+    let mut speed: Vec<i32> = (0..cols).map(|_| rng.gen_range(speed_base..speed_base + 2).max(1)).collect();
+    let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(trail_base..trail_base + 12)).collect();
     print!("\x1b[2J");
     let mut out = String::with_capacity(cols * rows * 6);
     loop {
@@ -218,16 +338,16 @@ fn run_matrix(cols: usize, rows: usize) -> Result<()> {
             head[c] += speed[c];
             if head[c] - trail[c] as i32 > rows as i32 {
                 head[c] = -(rng.gen_range(0..30));
-                speed[c] = rng.gen_range(1..3);
-                trail[c] = rng.gen_range(8..24);
+                speed[c] = rng.gen_range(speed_base..speed_base + 2).max(1);
+                trail[c] = rng.gen_range(trail_base..trail_base + 12);
             }
         }
         for r in 0..rows {
             for c in 0..cols {
                 match bright[r][c] {
-                    3 => out.push_str("\x1b[97m"),
+                    3 => out.push_str(head_color),
                     2 => out.push_str("\x1b[92m"),
-                    1 => out.push_str(if c % 7 == 0 { "\x1b[36m" } else { "\x1b[32m" }),
+                    1 => out.push_str(trail_alt),
                     _ => {}
                 }
                 out.push(grid[r][c]);
@@ -239,6 +359,7 @@ fn run_matrix(cols: usize, rows: usize) -> Result<()> {
         }
         print!("{out}");
         std::io::stdout().flush().ok();
-        thread::sleep(Duration::from_millis(33));
+        let delay = 40 - (intensity * 3).clamp(0, 35);
+        thread::sleep(Duration::from_millis(delay.max(8) as u64));
     }
 }

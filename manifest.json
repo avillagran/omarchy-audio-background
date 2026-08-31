@@ -5,19 +5,27 @@
   "version": "0.2.0",
   "author": "avillagran",
   "description": "Audio-reactive animated desktop background rendered as a real layer-shell background (WlrLayer.Background). Multiple rotating effects, fed by a configurable word list (default 'Omarchy'), always reactive to system audio. Low CPU (stdlib analyzer).",
+  "icon": "icon.svg",
   "kinds": [
     "bar-widget",
-    "service"
+    "service",
+    "panel"
   ],
   "entryPoints": {
     "barWidget": "BarWidget.qml",
-    "service": "Service.qml"
+    "service": "Service.qml",
+    "panel": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Audio Background",
     "description": "Toggle an audio-reactive background and pick its effect / word list",
     "category": "Fun",
     "defaultSection": "right",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "settingsForm": "audioBackgroundSettings"
+  },
+  "panel": {
+    "displayName": "Audio Background",
+    "description": "Configure the audio-reactive desktop background"
   }
 }

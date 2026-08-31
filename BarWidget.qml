@@ -1,9 +1,8 @@
 // Omarchy Audio Background — bar widget controller.
-// Left click: toggle the audio-reactive background on/off.
-// Right click: pick the effect (bars / wave / radial / rain) or toggle rotation.
-// The rendering is a real layer-shell background (Service.qml, WlrLayer.Background)
-// driven by the audio analyzer. State (running/effect/words/rotate) lives in
-// state.json, written here via bin/set_state.py and read by the service.
+// Left click: open the configuration panel (Panel.qml).
+// The rendering is a real layer-shell background (bin/ttfx-bg-rs) driven by
+// the audio analyzer. State (running/effect/intensity) lives in state.json,
+// written via bin/set_state.py and polled by both this widget and the panel.
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
@@ -19,34 +18,22 @@ BarWidget {
   readonly property string binDir: (typeof manifest !== "undefined" && manifest.__sourceDir)
     ? manifest.__sourceDir.replace(/\/$/, "")
     : Qt.resolvedUrl(".").toString().replace("file://", "")
+  readonly property string iconSvg: binDir + "/icon.svg"
   readonly property string setState: binDir + "/bin/set_state.py"
   readonly property string stateFile: Quickshell.env("HOME") +
     "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
 
   property bool running: true
-  property string effect: "bars"
-  readonly property var effects: ["bars", "wave", "radial", "rain"]
+  property string effect: "matrix"
+  property int intensity: 5
+
+  // Forward panel lifecycle so clicking the pill opens/closes it.
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+  function open()    { if (panelLoader.item && panelLoader.item.open)    panelLoader.item.open() }
+  function close()   { if (panelLoader.item && panelLoader.item.close)   panelLoader.item.close() }
+  function toggle()  { if (root.opened) root.close() else root.open() }
 
   function refresh() { statusProc.running = true }
-
-  function setRunning(v) {
-    root.running = v
-    Quickshell.execDetached(["python3", root.setState, "running=" + (v ? "1" : "0")])
-    pollTimer.restart()
-  }
-  function toggle() { root.setRunning(!root.running) }
-
-  function pickEffect(e) {
-    root.effect = e
-    Quickshell.execDetached(["python3", root.setState, "effect=" + e])
-    pollTimer.restart()
-  }
-  function toggleRotate() {
-    Quickshell.execDetached(["python3", root.setState, "rotate=" + (root.rotate ? "0" : "1")])
-    root.rotate = !root.rotate
-    pollTimer.restart()
-  }
-  property bool rotate: true
 
   Process {
     id: statusProc
@@ -58,57 +45,41 @@ BarWidget {
           var s = JSON.parse(text || "{}")
           if (typeof s.running === "boolean") root.running = s.running
           if (typeof s.effect === "string") root.effect = s.effect
-          if (typeof s.rotate === "boolean") root.rotate = s.rotate
+          if (typeof s.intensity === "number") root.intensity = s.intensity
         } catch (e) {}
       }
     }
   }
 
-  Timer {
-    id: pollTimer
-    interval: 800
-    repeat: false
-    onTriggered: root.refresh()
-  }
-
+  Timer { id: pollTimer; interval: 800; repeat: false; onTriggered: root.refresh() }
   Component.onCompleted: root.refresh()
+
+  // The panel is loaded in-process so the pill can summon it.
+  Loader {
+    id: panelLoader
+    active: true
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+  }
 
   // --- UI ---
   RowLayout {
-    spacing: 4
-    Text {
-      text: root.running ? "▮" : "▯"
-      color: root.running ? "#00ffea" : "#888"
-      font.pixelSize: 16
-      font.bold: true
+    spacing: 5
+    Image {
+      source: "file://" + root.iconSvg
+      sourceSize.width: 16; sourceSize.height: 16
+      fillMode: Image.PreserveAspectFit
     }
-    Label {
-      text: root.running ? ("bg:" + root.effect) : "bg"
-      color: root.running ? "#00ffea" : "#aaa"
+    Text {
+      text: root.running ? (root.effect) : "off"
+      color: root.running ? "#00ffea" : "#888"
       font.pixelSize: 12
     }
   }
 
   MouseArea {
     anchors.fill: parent
-    acceptedButtons: Qt.LeftButton | Qt.RightButton
-    onClicked: function (mouse) {
-      if (mouse.button === Qt.RightButton) effectMenu.open()
-      else root.toggle()
-    }
-  }
-
-  Menu {
-    id: effectMenu
-    title: "Background"
-    Repeater {
-      model: root.effects
-      MenuItem { text: modelData; onTriggered: root.pickEffect(modelData) }
-    }
-    MenuSeparator { }
-    MenuItem {
-      text: root.rotate ? "Rotation: ON" : "Rotation: OFF"
-      onTriggered: root.toggleRotate()
-    }
+    acceptedButtons: Qt.LeftButton
+    onClicked: root.toggle()
   }
 }
