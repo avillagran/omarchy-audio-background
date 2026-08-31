@@ -55,7 +55,7 @@ brightness follows band energy smoothly.
 {
   "running": true, "audio": true, "effect": "matrix",
   "effects": ["matrix","rain","wave","bars","donut","fire","starfield","life"],
-  "intensity": 5, "byline": "", "restart": 0, "intro_size": 1
+  "intensity": 5, "byline": "", "restart": 0, "intro_size": 5
 }
 ```
 
@@ -66,7 +66,8 @@ brightness follows band energy smoothly.
 - `intensity` — 0–10, animation speed / trail length.
 - `byline` — intro signature text; empty = default `By x.com/@avillagran`.
 - `restart` — counter; bump to replay the intro (bar-widget right-click).
-- `intro_size` — 1–3, intro title text scale.
+- `intro_size` — 1–16, intro title text scale. On dense HiDPI grids use a higher
+  value for a readable boot splash; centered horizontally and vertically.
 
 ## Control from the bar
 
@@ -133,17 +134,13 @@ HYPRLAND_INSTANCE_SIGNATURE=<from `echo $HYPRLAND_INSTANCE_SIGNATURE`> \
 
 ## Roadmap
 
-The goal is to use **ttfx** as the effects engine, vendored as a git submodule so it
-can be updated from upstream:
-
-1. **Bridge ttfx (Step 1).** Expose `ttfx`'s effect engine as a library (or a thin
-   wrapper crate) and call it from `bin/ttfx-bg-rs` instead of the hand-rolled
-   renderer — replacing the placeholder `matrix`/`rain`/`wave`/`bars` with ttfx's
-   real matrix / rain / fireworks / etc. effects. `ttfx-src/` is already a submodule
-   at `omacom/ttfx`; the bridge is the missing piece.
-2. **Audio-reactive (Step 2).** Feed system audio into the engine (PulseAudio /
-   PipeWire monitor capture) so the animations react to music, as the original
-   concept intended.
+**ttfx as the effects engine.** The current renderer is hand-rolled (matrix, rain,
+wave, bars, donut, fire, starfield, life) and is **already audio-reactive** — it
+captures the default sink monitor with `parec` and drives every effect from a
+per-band Goertzel analysis (see "Audio reactivity" above). The remaining step is to
+vendor [`ttfx`](https://github.com/omacom/ttfx) as the effects engine — replacing the
+hand-rolled effects with ttfx's richer set while keeping the same audio drive.
+`ttfx-src/` is already a submodule at `omacom/ttfx`; the bridge is the missing piece.
 
 ## Install / enable the plugin
 
@@ -151,7 +148,7 @@ Install from this repository with the Omarchy CLI (it clones into
 `~/.config/omarchy/plugins/<id>` automatically — no manual symlink needed):
 
 ```sh
-omarchy plugin add https://github.com/avillagran/omarchy-ttfx-background.git --enable --yes
+omarchy plugin add https://github.com/avillagran/omarchy-audio-background.git --enable --yes
 ```
 
 If the plugin is already on disk but the shell hasn't picked it up, force a reload:
@@ -165,7 +162,7 @@ kinds load. Left-click the bar widget to open the config panel.
 
 > For local development you can symlink your working copy into the plugins dir:
 > ```sh
-> ln -sfn "$PWD" ~/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background
+> ln -sfn "$PWD" ~/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background
 > ```
 > (run from the repo root, so `$PWD` resolves to your checkout — never hardcode a
 > user home path).

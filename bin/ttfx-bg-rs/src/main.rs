@@ -56,7 +56,7 @@ impl Default for Config {
             audio: true,
             byline: String::new(),
             restart: 0,
-            intro_size: 3,
+            intro_size: 5,
             show_fps: false,
         }
     }
@@ -154,7 +154,7 @@ fn main() -> Result<()> {
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
-        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(3);
+        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
         return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps);
@@ -631,18 +631,20 @@ fn pty_size() -> Option<(usize, usize)> {
 }
 
 // Intro: typewriter title + byline, then the effect takes over.
-// `intro_size` scales the block glyphs (1..6). The whole intro stack (title +
-// byline + effect tag) is centered on BOTH axes as a single unit — previously
-// the title's TOP was parked at rows/2, so the block hung in the lower half.
+// The whole intro stack (title + byline + effect tag) is centered on BOTH axes
+// as a single unit — previously the title's TOP was parked at rows/2, so the
+// block hung in the lower half. `intro_size` scales the block glyphs (1..16);
+// on HiDPI the cell grid is dense, so a large intro_size is what makes the boot
+// text actually read as a splash — hence the wide range.
 fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, intro_size: i64) {
-    let scale = intro_size.clamp(1, 6) as usize;
+    let scale = intro_size.clamp(1, 16) as usize;
     let title = "OMARCHY AUDIO BACKGROUND";
     let by = if byline.trim().is_empty() { DEFAULT_BYLINE } else { byline.trim() };
 
     // Block glyphs: each char becomes a `scale`×`scale` cell block. A cell is
     // `scale`× wider AND `scale`× taller, so this is uniform pixel scaling.
-    // One column of tracking between letters keeps them from fusing at size >1.
-    let ls = if scale > 1 { 1usize } else { 0 };  // letter spacing (cells)
+    // Tracking between letters grows with size so glyphs don't fuse when big.
+    let ls = if scale > 1 { (scale / 5).max(1) } else { 0 };  // letter spacing (cells)
     let adv = scale + ls;                          // horizontal advance per char
     let block_h = scale;
     let title_w = title.len() * adv - ls;

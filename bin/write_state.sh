@@ -7,7 +7,7 @@
 #   write_state.sh effect+fire          (enable effect in the rotation list)
 #   write_state.sh effect-fire          (disable it)
 #   write_state.sh intensity=0..10
-#   write_state.sh intro_size=1..6      (intro title text scale)
+#   write_state.sh intro_size=1..16     (intro title text scale)
 #   write_state.sh show_fps=1|0         (FPS counter overlay)
 #   write_state.sh byline=Some text     (intro byline; empty = default)
 #   write_state.sh restart              (bump restart counter -> replay intro)
@@ -16,7 +16,7 @@ STATE="${HOME}/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-backgr
 mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)
-running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="3"; show_fps="false"
+running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="5"; show_fps="false"
 effects="matrix rain wave bars donut fire starfield life"
 
 if [ -f "$STATE" ]; then
