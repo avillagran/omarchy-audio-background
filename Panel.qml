@@ -114,7 +114,7 @@ Panel {
             font.pixelSize: Style.font.body
             anchors.verticalCenter: parent.verticalCenter
           }
-          Switch {
+          ToggleSwitch {
             checked: root.running
             onToggled: root.setRunning(checked)
             anchors.verticalCenter: parent.verticalCenter
@@ -135,7 +135,7 @@ Panel {
             model: root.effects
             Button {
               text: modelData
-              highlighted: root.effect === modelData
+              selected: root.effect === modelData
               onClicked: root.pickEffect(modelData)
             }
           }
@@ -148,11 +148,12 @@ Panel {
           font.pixelSize: Style.font.bodySmall
           font.letterSpacing: 1
         }
-        Slider {
+        PanelSlider {
           width: parent.width
-          from: 0; to: 10; stepSize: 1
+          bar: root.bar
+          minimum: 0; maximum: 10; step: 1; integer: true
           value: root.intensity
-          onMoved: root.setIntensity(value)
+          onMoved: function(v) { root.setIntensity(v) }
         }
       }
     }
