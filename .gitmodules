@@ -1,0 +1,4 @@
+[submodule "ttfx-src"]
+	path = ttfx-src
+	url = https://github.com/omacom/ttfx
+	branch = master
