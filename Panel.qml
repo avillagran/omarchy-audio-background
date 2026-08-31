@@ -23,13 +23,15 @@ Panel {
   property string effect: "matrix"
   property int intensity: 5
   readonly property var effects: ["matrix", "rain", "wave", "bars"]
-  property string label: root.running ? "♪" : "♪̶"
+  property string label: running ? "♪" : "off"
 
   readonly property bool opened: root.controller && root.controller.visible === true
-  function open()          { root.controller.show() }
-  function close()         { root.controller.hide() }
-  function toggle()        { if (root.opened) root.close() else root.open() }
-  function openFromHotkey(){ root.open() }
+  function open() { root.controller.show() }
+  function close() { root.controller.hide() }
+  function toggle() {
+    if (root.opened) { root.close() } else { root.open() }
+  }
+  function openFromHotkey() { root.open() }
   property bool popoutSwitchClosing: false
   function closeForPopoutSwitch() { root.close() }
 
