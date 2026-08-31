@@ -1,7 +1,3 @@
-// Omarchy Audio Background — configuration panel.
-// Opened from the bar widget (BarWidget.qml). Writes user choices to
-// state.json via bin/set_state.py; the Rust background reader (bin/ttfx-bg-rs)
-// polls that file and applies running / effect / intensity live.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -18,57 +14,47 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property string binDir: (typeof manifest !== "undefined" && manifest.__sourceDir)
-    ? manifest.__sourceDir.replace(/\/$/, "")
-    : Qt.resolvedUrl(".").toString().replace("file://", "")
-  readonly property string setState: binDir + "/bin/set_state.py"
-  readonly property string iconPath: binDir + "/icon.svg"
+  readonly property string stateFile: Quickshell.env("HOME") +
+    "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
+  readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
+  readonly property string iconPath: Qt.resolvedUrl("icon.svg").toString().replace("file://", "")
 
   property bool running: true
   property string effect: "matrix"
   property int intensity: 5
   readonly property var effects: ["matrix", "rain", "wave", "bars"]
+  property string label: root.running ? "♪" : "♪̶"
 
-  function open()      { root.controller.show() }
-  function close()     { root.controller.hide() }
-  function toggle()    { if (root.opened) root.close() else root.open() }
+  readonly property bool opened: root.controller && root.controller.visible === true
+  function open()          { root.controller.show() }
+  function close()         { root.controller.hide() }
+  function toggle()        { if (root.opened) root.close() else root.open() }
+  function openFromHotkey(){ root.open() }
+  property bool popoutSwitchClosing: false
+  function closeForPopoutSwitch() { root.close() }
 
   function refresh() { statusProc.running = true }
-
-  function setRunning(v) {
-    root.running = v
-    Quickshell.execDetached(["python3", root.setState, "running=" + (v ? "1" : "0")])
-    pollTimer.restart()
-  }
-  function pickEffect(e) {
-    root.effect = e
-    Quickshell.execDetached(["python3", root.setState, "effect=" + e])
-    pollTimer.restart()
-  }
-  function setIntensity(v) {
-    root.intensity = v
-    Quickshell.execDetached(["python3", root.setState, "intensity=" + v])
-  }
+  function setRunning(v)   { root.running = v;  Quickshell.execDetached(["sh", root.writeState, "running="   + (v ? 1 : 0)]); pollTimer.restart() }
+  function pickEffect(e)   { root.effect  = e;  Quickshell.execDetached(["sh", root.writeState, "effect="    + e]);               pollTimer.restart() }
+  function setIntensity(v) { root.intensity = v; Quickshell.execDetached(["sh", root.writeState, "intensity=" + v]); }
 
   Component.onCompleted: root.refresh()
 
   Process {
     id: statusProc
-    command: ["cat", Quickshell.env("HOME") +
-      "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"]
+    command: ["cat", root.stateFile]
     running: false
     stdout: StdioCollector {
-      onStreamFinished: {
+      onStreamFinished: function() {
         try {
           var s = JSON.parse(text || "{}")
           if (typeof s.running === "boolean") root.running = s.running
-          if (typeof s.effect === "string") root.effect = s.effect
+          if (typeof s.effect === "string")   root.effect  = s.effect
           if (typeof s.intensity === "number") root.intensity = s.intensity
         } catch (e) {}
       }
     }
   }
-
   Timer { id: pollTimer; interval: 600; repeat: false; onTriggered: root.refresh() }
 
   IpcHandler {
@@ -99,7 +85,6 @@ Panel {
         leftPadding: Style.space(16); rightPadding: Style.space(16)
         topPadding: Style.space(14);  bottomPadding: Style.space(14)
 
-        // Header: plugin icon + title
         Row {
           spacing: Style.space(10)
           Image {
@@ -118,7 +103,6 @@ Panel {
           }
         }
 
-        // On / off toggle
         Row {
           spacing: Style.space(10)
           Text {
@@ -135,7 +119,6 @@ Panel {
           }
         }
 
-        // Effect picker
         Text {
           text: "EFFECT"
           color: Qt.darker(root.bar ? root.bar.foreground : "#fff", 1.5)
@@ -156,7 +139,6 @@ Panel {
           }
         }
 
-        // Intensity slider (0-10)
         Text {
           text: "INTENSITY"
           color: Qt.darker(root.bar ? root.bar.foreground : "#fff", 1.5)

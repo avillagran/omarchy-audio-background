@@ -1,37 +1,32 @@
-// Omarchy Audio Background — bar widget controller.
-// Left click: open the configuration panel (Panel.qml).
-// The rendering is a real layer-shell background (bin/ttfx-bg-rs) driven by
-// the audio analyzer. State (running/effect/intensity) lives in state.json,
-// written via bin/set_state.py and polled by both this widget and the panel.
 import QtQuick
-import QtQuick.Layouts
-import Quickshell
-import Quickshell.Io
-import QtQuick.Controls
-import qs.Ui
 import qs.Commons
+import qs.Ui
 
 BarWidget {
   id: root
   moduleName: "io.github.avillagran.omarchy-ttfx-background"
 
-  readonly property string binDir: (typeof manifest !== "undefined" && manifest.__sourceDir)
-    ? manifest.__sourceDir.replace(/\/$/, "")
-    : Qt.resolvedUrl(".").toString().replace("file://", "")
-  readonly property string iconSvg: binDir + "/icon.svg"
-  readonly property string setState: binDir + "/bin/set_state.py"
   readonly property string stateFile: Quickshell.env("HOME") +
     "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
+  readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
 
   property bool running: true
   property string effect: "matrix"
   property int intensity: 5
 
-  // Forward panel lifecycle so clicking the pill opens/closes it.
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   function open()    { if (panelLoader.item && panelLoader.item.open)    panelLoader.item.open() }
   function close()   { if (panelLoader.item && panelLoader.item.close)   panelLoader.item.close() }
   function toggle()  { if (root.opened) root.close() else root.open() }
+  function togglePanel() { if (panelLoader.item && panelLoader.item.toggle) panelLoader.item.toggle() }
+
+  function injectPanel() {
+    var t = panelLoader.item
+    if (!t) return
+    if ("bar" in t) t.bar = root.bar
+    if ("anchorItem" in t) t.anchorItem = button
+    if ("hostWidget" in t) t.hostWidget = root
+  }
 
   function refresh() { statusProc.running = true }
 
@@ -40,11 +35,11 @@ BarWidget {
     command: ["cat", root.stateFile]
     running: false
     stdout: StdioCollector {
-      onStreamFinished: {
+      onStreamFinished: function() {
         try {
           var s = JSON.parse(text || "{}")
           if (typeof s.running === "boolean") root.running = s.running
-          if (typeof s.effect === "string") root.effect = s.effect
+          if (typeof s.effect === "string")   root.effect  = s.effect
           if (typeof s.intensity === "number") root.intensity = s.intensity
         } catch (e) {}
       }
@@ -54,32 +49,24 @@ BarWidget {
   Timer { id: pollTimer; interval: 800; repeat: false; onTriggered: root.refresh() }
   Component.onCompleted: root.refresh()
 
-  // The panel is loaded in-process so the pill can summon it.
   Loader {
     id: panelLoader
     active: true
     source: Qt.resolvedUrl("Panel.qml")
     visible: false
+    onLoaded: { root.injectPanel(); Qt.callLater(root.injectPanel) }
   }
 
-  // --- UI ---
-  RowLayout {
-    spacing: 5
-    Image {
-      source: "file://" + root.iconSvg
-      sourceSize.width: 16; sourceSize.height: 16
-      fillMode: Image.PreserveAspectFit
-    }
-    Text {
-      text: root.running ? (root.effect) : "off"
-      color: root.running ? "#00ffea" : "#888"
-      font.pixelSize: 12
-    }
-  }
-
-  MouseArea {
+  BarIconButton {
+    id: button
     anchors.fill: parent
-    acceptedButtons: Qt.LeftButton
-    onClicked: root.toggle()
+    bar: root.bar
+    text: root.running ? "♪" : "♪̶"
+    slotSize: Style.bar.statusSlot
+    onPressed: function(b) {
+      if (!root.bar) return
+      if (b === Qt.RightButton) root.refresh()
+      else root.togglePanel()
+    }
   }
 }
