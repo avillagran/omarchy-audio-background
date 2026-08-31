@@ -8,3 +8,9 @@ __pycache__/
 
 # Logs
 *.log
+
+# Prebuilt plugin binaries (committed on purpose — no build step for the user):
+#   bin/ttfx-bg-rs-aarch64
+#   bin/ttfx-bg-rs-x86_64
+# Python leftovers
+__pycache__/
