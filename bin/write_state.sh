@@ -2,7 +2,7 @@
 # Write one key=value pair into the plugin state.json, preserving the others.
 # Usage: write_state.sh running=1 | effect=rain | intensity=5
 set -e
-STATE="${HOME}/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
+STATE="${HOME}/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
 mkdir -p "$(dirname "$STATE")"
 
 key="${1%%=*}"; val="${1#*=}"

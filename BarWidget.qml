@@ -7,11 +7,11 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "io.github.avillagran.omarchy-ttfx-background"
+  moduleName: "io.github.avillagran.omarchy-audio-background"
 
   readonly property string iconPath: Qt.resolvedUrl("icon.svg").toString().replace("file://", "")
   readonly property string stateFile: Quickshell.env("HOME") +
-    "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
+    "/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
 
   property bool running: true
@@ -61,7 +61,10 @@ BarWidget {
   }
 
   // Icon (music note over rectangle) + live state label.
+  implicitWidth: row.implicitWidth
+  implicitHeight: row.implicitHeight
   RowLayout {
+    id: row
     spacing: 5
     Image {
       source: "file://" + root.iconPath

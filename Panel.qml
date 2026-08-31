@@ -6,8 +6,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "io.github.avillagran.omarchy-ttfx-background"
-  ipcTarget: "io.github.avillagran.omarchy-ttfx-background"
+  moduleName: "io.github.avillagran.omarchy-audio-background"
+  ipcTarget: "io.github.avillagran.omarchy-audio-background"
   manageIpc: false
 
   property var anchorItem: null
@@ -15,7 +15,7 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   readonly property string stateFile: Quickshell.env("HOME") +
-    "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
+    "/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
   readonly property string iconPath: Qt.resolvedUrl("icon.svg").toString().replace("file://", "")
 

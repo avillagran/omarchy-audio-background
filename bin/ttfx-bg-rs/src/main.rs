@@ -34,7 +34,7 @@ struct Config {
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
-        .join(".config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json")
+        .join(".config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/state.json")
 }
 
 // Best-effort read of the panel's state.json. Missing/invalid => defaults.
