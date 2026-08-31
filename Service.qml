@@ -13,7 +13,10 @@ import Quickshell.Io
 // No build step: the binaries are committed, so `omarchy plugin add` is enough.
 Item {
   id: root
-  property string pluginDir: Quickshell.pluginDir
+  // Plugin directory: resolve relative to this QML file. `Quickshell.pluginDir`
+  // is NOT available in the `service` kind context (it was `undefined`), so we
+  // use Qt.resolvedUrl(".") like BarWidget/Panel do.
+  readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
 
   Process {
     id: bgProc
