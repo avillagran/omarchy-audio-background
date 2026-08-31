@@ -79,8 +79,12 @@ brightness follows band energy smoothly.
 
 ## Running
 
-The background is meant to run as a **systemd user service** (so it survives agent /
-shell restarts and auto-restarts on failure):
+When the plugin is enabled, its `service` kind starts the background automatically —
+no extra steps. Just `omarchy plugin add … --enable` and restart the shell.
+
+Optionally, for a background that survives shell restarts and auto-restarts on crash
+independent of the shell, run it as a **systemd user service** instead. Use this OR
+the built-in plugin service, **not both** (two instances would stack and double CPU):
 
 ```sh
 cp ttfx-bg.service ~/.config/systemd/user/
@@ -88,9 +92,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now ttfx-bg.service
 ```
 
-The service inherits the graphical-session environment (`WAYLAND_DISPLAY`,
+The unit's `ExecStart` uses `%h` (the installing user's home) and the
+`bin/ttfx-bg-launch.sh` arch launcher, so it works on any install with no edits. It
+inherits the graphical-session environment (`WAYLAND_DISPLAY`,
 `HYPRLAND_INSTANCE_SIGNATURE`, `DBUS_SESSION_BUS_ADDRESS`) from `systemctl --user
-show-environment`. To run manually for debugging:
+show-environment`.
+
+To build and run the renderer manually for debugging:
 
 ```sh
 cd bin/ttfx-bg-rs
@@ -105,7 +113,10 @@ HYPRLAND_INSTANCE_SIGNATURE=<from `echo $HYPRLAND_INSTANCE_SIGNATURE`> \
 - `bin/ttfx-bg-rs/src/main.rs` — layer-shell windows (one per monitor), Vte host,
   `state.json` polling, renderer lifecycle.
 - `bin/ttfx-bg-rs/Cargo.toml` — gtk4, gtk4-layer-shell, vte4, rand, anyhow.
-- `manifest.json` — plugin manifest (kinds: `bar-widget`, `service`, `panel`).
+- `manifest.json` — plugin manifest (kinds: `bar-widget`, `service`). The bar widget
+  opens the config panel (`Panel.qml`) via an internal `Loader`; do NOT add a `panel`
+  kind — the shell treats any plugin with a `panel`/`overlay`/`menu` kind as a pure
+  panel and would then NOT load the bar widget (the bar icon would disappear).
 - `BarWidget.qml` — bar icon / opens config panel.
 - `Panel.qml` — configuration panel (toggle, effect, intensity).
 - `icon.svg` — plugin icon (music note over rectangle).

@@ -1,16 +1,25 @@
 [Unit]
-Description=ttfx audio-reactive desktop background (Rust layer-shell renderer)
+Description=Omarchy Audio Background (Rust layer-shell renderer)
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# Run the Rust background directly. systemd --user already inherits the
-# graphical session environment (WAYLAND_DISPLAY, HYPRLAND_*, DBUS_*) that was
-# imported via `systemctl --user import-environment`, so no `source` needed.
+# OPTIONAL alternative to the plugin's built-in Quickshell `service` kind.
+# The plugin already auto-starts the background when it is enabled, so use this
+# unit OR the plugin service — NOT both at once, or you get two stacked
+# backgrounds (double CPU). Pick this unit if you want the background to survive
+# shell restarts and auto-restart on crash independent of the shell.
+#
+# `%h` is the installing user's home (systemd expands it) and the launcher
+# script selects the right prebuilt binary for the machine's architecture, so
+# this path is generic — do not hardcode a specific user's home here.
+#
 # No `setsid`: it would detach the tracked PID and make systemd think the
-# service exited.
-ExecStart=/home/avillagran/Work/omarchy-plugins/omarchy-ttfx-background/bin/ttfx-bg-rs/target/release/ttfx-bg-rs
+# service exited. systemd --user already inherits the graphical-session
+# environment (WAYLAND_DISPLAY, HYPRLAND_*, DBUS_*) imported via
+# `systemctl --user import-environment`.
+ExecStart=%h/.config/omarchy/plugins/io.github.avillagran.omarchy-audio-background/bin/ttfx-bg-launch.sh
 Restart=always
 RestartSec=1
 

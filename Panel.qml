@@ -21,10 +21,11 @@ Panel {
 
   property bool running: true
   property bool audio: true
+  property bool showFps: false
   property string effect: "matrix"
   property var effects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   property int intensity: 5
-  property int introSize: 1
+  property int introSize: 3
   property string byline: ""
   property string label: "♪"
 
@@ -40,6 +41,7 @@ Panel {
   function write(arg) { Quickshell.execDetached(["sh", root.writeState, arg]) }
   function setRunning(v)   { root.running = v;   write("running="   + (v ? "1" : "0")); }
   function setAudio(v)     { root.audio = v;     write("audio="     + (v ? "1" : "0")); }
+  function setShowFps(v)   { root.showFps = v;   write("show_fps="  + (v ? "1" : "0")); }
   function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
   function setIntroSize(v) { root.introSize = v; write("intro_size=" + v); }
@@ -66,6 +68,7 @@ Panel {
           var s = JSON.parse(text || "{}")
           if (typeof s.running === "boolean") root.running = s.running
           if (typeof s.audio === "boolean")   root.audio = s.audio
+          if (typeof s.show_fps === "boolean") root.showFps = s.show_fps
           if (typeof s.effect === "string")   root.effect = s.effect
           if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.intensity === "number") root.intensity = s.intensity
@@ -90,6 +93,10 @@ Panel {
     bar: root.bar
     open: root.opened
     contentWidth: panel.fittedContentWidth(Style.space(380))
+    // Height must follow the content or the card stays at the default
+    // contentHeight (200) and the taller layout overflows below it, leaving
+    // most controls rendered on bare desktop with no card behind them.
+    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
     focusTarget: keyCatcher
 
     PanelKeyCatcher {
@@ -99,6 +106,7 @@ Panel {
       onTabRequested: function(d) { if (root.bar) root.bar.switchPanelFrom(root.barIdentity, d) }
 
       ColumnLayout {
+        id: contentColumn
         width: parent.width
         spacing: Style.space(12)
 
@@ -116,7 +124,10 @@ Panel {
           }
           ToggleSwitch {
             checked: root.running
-            onToggled: root.setRunning(checked)
+            // ToggleSwitch is a controlled component: toggled() passes no
+            // value and it never mutates `checked` itself, so flip the real
+            // state. Passing `checked` here would be a no-op.
+            onToggled: root.setRunning(!root.running)
           }
         }
 
@@ -132,7 +143,23 @@ Panel {
           }
           ToggleSwitch {
             checked: root.audio
-            onToggled: root.setAudio(checked)
+            onToggled: root.setAudio(!root.audio)
+          }
+        }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(10)
+          Text {
+            text: "Show FPS"
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : "sans"
+            font.pixelSize: Style.font.body
+            Layout.fillWidth: true
+          }
+          ToggleSwitch {
+            checked: root.showFps
+            onToggled: root.setShowFps(!root.showFps)
           }
         }
 
@@ -152,7 +179,8 @@ Panel {
             }
             ToggleSwitch {
               checked: root.effects.indexOf(modelData) >= 0
-              onToggled: root.toggleEffect(modelData, checked)
+              // Controlled component: invert the current membership, don't pass `checked`.
+              onToggled: root.toggleEffect(modelData, !(root.effects.indexOf(modelData) >= 0))
             }
           }
         }
@@ -170,7 +198,7 @@ Panel {
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
-          minimum: 1; maximum: 3; step: 1; integer: true
+          minimum: 1; maximum: 6; step: 1; integer: true
           value: root.introSize
           onMoved: function(v) { root.setIntroSize(v) }
         }
@@ -178,9 +206,15 @@ Panel {
         PanelSectionHeader { text: "INTRO BYLINE" }
         TextField {
           Layout.fillWidth: true
-          text: root.byline
-          placeholderText: "By x.com/@avillagran"
-          onEditingFinished: root.setByline(text)
+          // Default signature; emptying the field reverts to it.
+          property string defaultByline: "By x.com/@avillagran"
+          text: root.byline.trim() === "" ? defaultByline : root.byline
+          placeholderText: defaultByline
+          onEditingFinished: {
+            if (text.trim() === "") text = defaultByline
+            // Empty means "use the built-in default" (Rust also defaults to it).
+            root.setByline(text === defaultByline ? "" : text)
+          }
         }
       }
     }

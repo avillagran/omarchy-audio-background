@@ -29,6 +29,10 @@ BarWidget {
     if ("hostWidget" in t) t.hostWidget = root
   }
 
+  // The bar is assigned asynchronously after the widget loads; re-inject the
+  // panel then, or it keeps bar=null and the popup can't anchor/open.
+  onBarChanged: injectPanel()
+
   function refresh() { statusProc.running = true }
 
   // Right click: restart the background (bump restart counter -> replays intro).

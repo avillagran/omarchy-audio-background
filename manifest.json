@@ -2,19 +2,17 @@
   "schemaVersion": 1,
   "id": "io.github.avillagran.omarchy-audio-background",
   "name": "Omarchy Audio Background",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "avillagran",
   "description": "Audio-reactive animated desktop background rendered as a real layer-shell background (WlrLayer.Background). Multiple rotating effects, fed by a configurable word list (default 'Omarchy'), always reactive to system audio. Low CPU (stdlib analyzer).",
   "icon": "icon.svg",
   "kinds": [
     "bar-widget",
-    "service",
-    "panel"
+    "service"
   ],
   "entryPoints": {
     "barWidget": "BarWidget.qml",
-    "service": "Service.qml",
-    "panel": "Panel.qml"
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "Audio Background",
@@ -23,9 +21,5 @@
     "defaultSection": "right",
     "allowMultiple": false,
     "settingsForm": "audioBackgroundSettings"
-  },
-  "panel": {
-    "displayName": "Audio Background",
-    "description": "Configure the audio-reactive desktop background"
   }
 }

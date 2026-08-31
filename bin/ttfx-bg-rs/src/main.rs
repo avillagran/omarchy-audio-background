@@ -43,6 +43,7 @@ struct Config {
     byline: String,
     restart: i64,
     intro_size: i64,
+    show_fps: bool,
 }
 
 impl Default for Config {
@@ -55,7 +56,8 @@ impl Default for Config {
             audio: true,
             byline: String::new(),
             restart: 0,
-            intro_size: 1,
+            intro_size: 3,
+            show_fps: false,
         }
     }
 }
@@ -82,6 +84,7 @@ fn read_config() -> Config {
     if let Some(v) = json_num(&text, "intensity") { cfg.intensity = v; }
     if let Some(v) = json_num(&text, "restart") { cfg.restart = v; }
     if let Some(v) = json_num(&text, "intro_size") { cfg.intro_size = v; }
+    if let Some(v) = json_bool(&text, "show_fps") { cfg.show_fps = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -151,8 +154,10 @@ fn main() -> Result<()> {
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
-        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
-        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size);
+        let intro_size = arg_value(&args, "--intro-size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(3);
+        let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
+        let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
+        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps);
     }
 
     gtk4::init()?;
@@ -343,6 +348,8 @@ fn spawn_layer_for_monitor(
         let ch = if (ascent + descent) > 0.0 { ascent + descent } else { font_size * 1.2 };
         let cols = ((geo.width() as f64) / cw).floor().max(80.0) as usize;
         let rows = ((geo.height() as f64) / ch).floor().max(24.0) as usize;
+        // Cell aspect (height/width in px) so effects can draw true circles.
+        let cell_aspect = if cw > 0.0 { ch / cw } else { 2.0 };
         let byline = if cfg.byline.trim().is_empty() { DEFAULT_BYLINE } else { cfg.byline.trim() }.to_string();
         let audio = if cfg.audio { "1" } else { "0" };
         let argv: Vec<String> = vec![
@@ -355,6 +362,8 @@ fn spawn_layer_for_monitor(
             "--audio".into(), audio.into(),
             "--byline".into(), byline,
             "--intro-size".into(), cfg.intro_size.to_string(),
+            "--cell-aspect".into(), format!("{cell_aspect:.3}"),
+            "--show-fps".into(), if cfg.show_fps { "1".into() } else { "0".into() },
         ];
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         // Pre-clear so Vte doesn't flash its "N by M cells" placeholder while
@@ -518,10 +527,14 @@ struct Screen {
     out: String,
     grid: Vec<Vec<char>>,
     tint: Vec<Vec<u8>>, // 0 = default, 1.. = palette index
+    show_fps: bool,
+    fps_frames: u32,
+    fps_since: std::time::Instant,
+    fps_value: f32,
 }
 
 impl Screen {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, show_fps: bool) -> Self {
         print!("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
         std::io::stdout().flush().ok();
         Screen {
@@ -529,6 +542,26 @@ impl Screen {
             out: String::with_capacity(cols * rows * 8),
             grid: vec![vec![' '; cols]; rows],
             tint: vec![vec![0u8; cols]; rows],
+            show_fps,
+            fps_frames: 0,
+            fps_since: std::time::Instant::now(),
+            fps_value: 0.0,
+        }
+    }
+    // Call once per frame; draws an FPS readout in the top-left corner when
+    // the user enabled it in preferences.
+    fn fps_overlay(&mut self) {
+        if !self.show_fps { return; }
+        self.fps_frames += 1;
+        let el = self.fps_since.elapsed().as_secs_f32();
+        if el >= 0.5 {
+            self.fps_value = self.fps_frames as f32 / el;
+            self.fps_frames = 0;
+            self.fps_since = std::time::Instant::now();
+        }
+        let text = format!("FPS {:.0}", self.fps_value);
+        for (i, ch) in text.chars().enumerate() {
+            if i < self.cols { self.put(i, 0, ch, 1); }
         }
     }
     fn clear(&mut self) {
@@ -561,6 +594,23 @@ impl Screen {
         print!("{}", self.out);
         std::io::stdout().flush().ok();
     }
+    // Re-read the PTY size; if it changed (window resized / Vte expanded it
+    // after spawn), reallocate the grid and report the change so the caller
+    // restarts the effect cleanly at the new size.
+    fn maybe_resize(&mut self) -> bool {
+        if let Some((c, r)) = pty_size() {
+            if c != self.cols || r != self.rows {
+                self.cols = c;
+                self.rows = r;
+                self.grid = vec![vec![' '; c]; r];
+                self.tint = vec![vec![0u8; c]; r];
+                self.out = String::with_capacity(c * r * 8);
+                print!("\x1b[2J\x1b[H");
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // Actual size of the PTY we render into. The parent computes cols/rows from
@@ -581,53 +631,75 @@ fn pty_size() -> Option<(usize, usize)> {
 }
 
 // Intro: typewriter title + byline, then the effect takes over.
-// `intro_size` scales the block glyphs (1..3).
+// `intro_size` scales the block glyphs (1..6). The whole intro stack (title +
+// byline + effect tag) is centered on BOTH axes as a single unit — previously
+// the title's TOP was parked at rows/2, so the block hung in the lower half.
 fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, intro_size: i64) {
-    let scale = intro_size.clamp(1, 3) as usize;
+    let scale = intro_size.clamp(1, 6) as usize;
     let title = "OMARCHY AUDIO BACKGROUND";
     let by = if byline.trim().is_empty() { DEFAULT_BYLINE } else { byline.trim() };
+
+    // Block glyphs: each char becomes a `scale`×`scale` cell block. A cell is
+    // `scale`× wider AND `scale`× taller, so this is uniform pixel scaling.
+    // One column of tracking between letters keeps them from fusing at size >1.
+    let ls = if scale > 1 { 1usize } else { 0 };  // letter spacing (cells)
+    let adv = scale + ls;                          // horizontal advance per char
     let block_h = scale;
-    let ty = scr.rows / 2;
-    let tx = scr.cols.saturating_sub(title.len() * scale) / 2;
+    let title_w = title.len() * adv - ls;
+
+    // Vertical layout of the whole stack, then center it.
+    let gap = 1usize;
+    let byline_off = block_h + gap;                // byline row offset from block top
+    let tag_off = byline_off + 1 + gap;            // effect-tag row offset
+    let total_h = tag_off + 1;
+    let ty = scr.rows.saturating_sub(total_h) / 2; // top of the centered block
+    let tx = scr.cols.saturating_sub(title_w) / 2;
     let bx = scr.cols.saturating_sub(by.len()) / 2;
+
+    let draw_title = |scr: &mut Screen, upto: usize| {
+        for (i, ch) in title.chars().take(upto).enumerate() {
+            let cx = tx + i * adv;
+            for dx in 0..scale { for dy in 0..block_h {
+                scr.put(cx + dx, ty + dy, ch, 1);
+            }}
+        }
+    };
+
+    // Typewriter: title.
     for step in 0..=title.len() {
         scr.clear();
-        for (i, ch) in title.chars().take(step).enumerate() {
-            for dx in 0..scale { for dy in 0..block_h {
-                scr.put(tx + i * scale + dx, ty + dy, ch, 1);
-            }}
-        }
+        draw_title(scr, step);
+        scr.fps_overlay();
         scr.present(palette);
-        thread::sleep(Duration::from_millis(24));
+        thread::sleep(Duration::from_millis(20));
     }
+    // Byline types in under the (now complete) title.
     for step in 0..=by.len() {
         scr.clear();
-        for (i, ch) in title.chars().enumerate() {
-            for dx in 0..scale { for dy in 0..block_h {
-                scr.put(tx + i * scale + dx, ty + dy, ch, 1);
-            }}
-        }
-        for (i, ch) in by.chars().take(step).enumerate() { scr.put(bx + i, ty + block_h + 1, ch, 2); }
+        draw_title(scr, title.len());
+        for (i, ch) in by.chars().take(step).enumerate() { scr.put(bx + i, ty + byline_off, ch, 2); }
+        scr.fps_overlay();
         scr.present(palette);
-        thread::sleep(Duration::from_millis(16));
+        thread::sleep(Duration::from_millis(14));
     }
-    // effect name stamp
+    // Effect name stamp.
     let tag = format!("— {effect} —");
     let ex = scr.cols.saturating_sub(tag.len()) / 2;
-    for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + block_h + 3, ch, 3); }
+    for (i, ch) in tag.chars().enumerate() { scr.put(ex + i, ty + tag_off, ch, 3); }
     scr.present(palette);
     thread::sleep(Duration::from_millis(900));
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64) -> Result<()> {
+fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool) -> Result<()> {
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
-    // Clamp to the REAL PTY size so we never overflow and scroll.
+    // Start at the REAL PTY size (Vte may round the spawn-time size); the
+    // effect loops re-check it each frame and restart cleanly on change.
     let (cols, rows) = match pty_size() {
-        Some((c, r)) => (cols.min(c), rows.min(r)),
+        Some((c, r)) => (c, r),
         None => (cols, rows),
     };
-    let mut scr = Screen::new(cols, rows);
+    let mut scr = Screen::new(cols, rows, show_fps);
 
     let palette: &[&str] = match effect {
         "rain" => &["\x1b[96m", "\x1b[36m", "\x1b[37m"],
@@ -642,15 +714,25 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
 
     show_intro(&mut scr, palette, byline, effect, intro_size);
 
-    match effect {
-        "donut" => fx_donut(&mut scr, palette, intensity, &state),
-        "fire" => fx_fire(&mut scr, palette, intensity, &state),
-        "starfield" => fx_starfield(&mut scr, palette, intensity, &state),
-        "life" => fx_life(&mut scr, palette, intensity, &state),
-        "wave" => fx_wave(&mut scr, palette, intensity, &state),
-        "bars" => fx_bars(&mut scr, palette, intensity, &state),
-        _ => fx_matrix(&mut scr, palette, intensity, &state, effect == "rain"),
+    // Each effect returns Ok(()) when it detects a PTY resize; re-dispatch so
+    // it restarts with fresh state at the new size (no jump, no stale grid).
+    loop {
+        let res = match effect {
+            "donut" => fx_donut(&mut scr, palette, intensity, &state, cell_aspect),
+            "fire" => fx_fire(&mut scr, palette, intensity, &state),
+            "starfield" => fx_starfield(&mut scr, palette, intensity, &state),
+            "life" => fx_life(&mut scr, palette, intensity, &state),
+            "wave" => fx_wave(&mut scr, palette, intensity, &state),
+            "bars" => fx_bars(&mut scr, palette, intensity, &state),
+            _ => fx_matrix(&mut scr, palette, intensity, &state, effect == "rain"),
+        };
+        if let Err(e) = res {
+            eprintln!("render error: {e:?}");
+            break;
+        }
+        // Ok(()) => resize happened; loop and restart the effect.
     }
+    Ok(())
 }
 
 // Audio-reactive pacing: more sound => faster flow (lower delay), smoothly.
@@ -678,6 +760,7 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSt
     let mut speed: Vec<i32> = (0..cols).map(|_| rng.gen_range(speed_base..speed_base + 2).max(1)).collect();
     let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(trail_base..trail_base + 12)).collect();
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         let vol = audio.volume();
         let spawn_chance = 0.35 + vol * 0.65; // caudal: more drops with sound
@@ -704,6 +787,7 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSt
                 }
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         thread::sleep(frame_delay(40, intensity, audio));
     }
@@ -713,6 +797,7 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSt
 fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
     let mut t = 0f32;
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         let lv = audio.volume();
         let (cols, rows) = (scr.cols, scr.rows);
@@ -728,6 +813,7 @@ fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
                 }
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         t += 0.12 + lv * 0.25;
         thread::sleep(frame_delay(45, intensity, audio));
@@ -740,6 +826,7 @@ fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
     let bands = NBANDS;
     let mut heights = vec![0f32; bands];
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         let (cols, rows) = (scr.cols, scr.rows);
         let maxh = rows as f32 * 0.9;
@@ -756,22 +843,28 @@ fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
                 }
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         thread::sleep(frame_delay(50, intensity, audio));
     }
 }
 
 // --- donut: classic 3D torus, scaled to the grid. Spin speed follows audio. ---
-fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+// Scale follows the original donut.c proportions (30/80 horizontal, 15/22
+// vertical), which already bake in the terminal cell aspect. That keeps the
+// torus round on any screen; compressing by cell_aspect over-flattened it.
+fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState, cell_aspect: f32) -> Result<()> {
+    let _ = cell_aspect;
     let mut a = 0f32;
     let mut e = 1f32;
     let (cols, rows) = (scr.cols, scr.rows);
     let cx = cols as f32 / 2.0;
     let cy = rows as f32 / 2.0;
-    let sx = cols as f32 * 0.36;
-    let sy = rows as f32 * 0.36;
+    let sx = cols as f32 * (30.0 / 80.0);
+    let sy = rows as f32 * (15.0 / 22.0);
     let mut zbuf = vec![0f32; cols * rows];
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         for b in zbuf.iter_mut() { *b = 0.0; }
         let lv = audio.volume();
@@ -801,6 +894,7 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSta
             }
             j += 0.07;
         }
+        scr.fps_overlay();
         scr.present(palette);
         let spin = 1.0 + lv * 2.0;
         a += 0.04 * spin;
@@ -817,6 +911,7 @@ fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
     let palette_chars: Vec<char> = " .:-=+*#%@".chars().collect();
     let mut heat = vec![vec![0u8; cols]; rows];
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         let lv = audio.volume();
         // bottom row: fuel, fanned by the audio level
         let fuel = (28.0 + lv * 8.0 + intensity as f32 * 0.4) as u8;
@@ -839,6 +934,7 @@ fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
                 }
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         thread::sleep(frame_delay(45, intensity, audio));
     }
@@ -856,6 +952,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &Audi
         rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(0.05..1.0),
     )).collect();
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         let lv = audio.volume();
         let speed = (0.006 + intensity as f32 * 0.0012) * (1.0 + lv * 2.2);
@@ -870,6 +967,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &Audi
                 scr.put(px as usize, py as usize, ch, tint);
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         thread::sleep(frame_delay(40, intensity, audio));
     }
@@ -887,6 +985,7 @@ fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
     for y in 0..rows { for x in 0..cols { grid[y][x] = rng.gen::<f32>() < density; } }
     let mut stagnant = 0u32;
     loop {
+        if scr.maybe_resize() { return Ok(()); }
         scr.clear();
         for y in 0..rows {
             for x in 0..cols {
@@ -899,6 +998,7 @@ fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
                 }
             }
         }
+        scr.fps_overlay();
         scr.present(palette);
         let mut changed = 0u32;
         for y in 0..rows {
