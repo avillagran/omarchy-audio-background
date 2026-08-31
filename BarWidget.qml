@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Layouts
 import qs.Commons
 import qs.Ui
 
@@ -6,6 +7,7 @@ BarWidget {
   id: root
   moduleName: "io.github.avillagran.omarchy-ttfx-background"
 
+  readonly property string iconPath: Qt.resolvedUrl("icon.svg").toString().replace("file://", "")
   readonly property string stateFile: Quickshell.env("HOME") +
     "/.config/omarchy/plugins/io.github.avillagran.omarchy-ttfx-background/state.json"
   readonly property string writeState: Qt.resolvedUrl("bin/write_state.sh").toString().replace("file://", "")
@@ -24,7 +26,7 @@ BarWidget {
     var t = panelLoader.item
     if (!t) return
     if ("bar" in t) t.bar = root.bar
-    if ("anchorItem" in t) t.anchorItem = button
+    if ("anchorItem" in t) t.anchorItem = root
     if ("hostWidget" in t) t.hostWidget = root
   }
 
@@ -57,15 +59,26 @@ BarWidget {
     onLoaded: { root.injectPanel(); Qt.callLater(root.injectPanel) }
   }
 
-  BarIconButton {
-    id: button
+  // Icon (music note over rectangle) + live state label.
+  RowLayout {
+    spacing: 5
+    Image {
+      source: "file://" + root.iconPath
+      sourceSize.width: 16; sourceSize.height: 16
+      fillMode: Image.PreserveAspectFit
+    }
+    Text {
+      text: root.running ? root.effect : "off"
+      color: root.running ? "#00ffea" : "#888"
+      font.pixelSize: 12
+    }
+  }
+
+  MouseArea {
     anchors.fill: parent
-    bar: root.bar
-    text: root.running ? "♪" : "♪̶"
-    slotSize: Style.bar.statusSlot
-    onPressed: function(b) {
-      if (!root.bar) return
-      if (b === Qt.RightButton) root.refresh()
+    acceptedButtons: Qt.LeftButton | Qt.RightButton
+    onClicked: function(m) {
+      if (m.button === Qt.RightButton) root.refresh()
       else root.togglePanel()
     }
   }
