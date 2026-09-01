@@ -55,7 +55,10 @@ Panel {
   function setResolution(v) { root.resolution = v;  write("resolution=" + v); }
   function setReactivity(v) { root.reactivity = v;  write("reactivity=" + v); }
   function setTtfxText(t)  { root.ttfxText = t;    write("ttfx_text=" + t); }
-  function pickEffect(e)   { root.effect = e;    write("effect="    + e); }
+  function pickEffect(e)   { root.effect = e;    write("effect="    + e);
+    // Keep the picked effect in the rotation set so the rotation doesn't skip it.
+    if (root.effects.indexOf(e) < 0) { root.effects = root.effects.concat([e]); write("effect+" + e) }
+  }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
   function setIntroSize(v) {
     root.introSize = v
@@ -125,22 +128,34 @@ Panel {
     function toggle(): void { root.toggle() }
   }
 
-  KeyboardPanel {
+  CardWindow {
     id: panel
     anchorItem: root.anchorItem
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(700))
-    // Height must follow the content or the card stays at the default
-    // contentHeight (200) and the taller layout overflows below it, leaving
-    // most controls rendered on bare desktop with no card behind them.
+    centerOnBar: false  // anchor under the bar widget (like KeyboardPanel's default), not centered
+    contentWidth: panel.fittedContentWidth(Style.space(560))
+    // Height must follow the content or the card stays short and the taller layout
+    // overflows below it (controls rendered on bare desktop with no card behind them).
     contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
     focusTarget: keyCatcher
+
+    // Translucent card (0.6 opacity) so the animated background shows through. This is
+    // why we use CardWindow instead of KeyboardPanel (whose card is hardcoded opaque).
+    Rectangle {
+      id: cardSurface
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      border.color: Color.popups.border
+      border.width: 1
+      color: Qt.rgba(Color.popups.background.r, Color.popups.background.g, Color.popups.background.b, 0.6)
+    }
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      anchors.margins: panel.padding
       onCloseRequested: root.close()
       onTabRequested: function(d) { if (root.bar) root.bar.switchPanelFrom(root.barIdentity, d) }
 
@@ -151,55 +166,18 @@ Panel {
 
         PanelSectionHeader { text: "AUDIO BACKGROUND" }
 
+        // Main toggles in one compact row (short labels so three fit across).
         RowLayout {
           Layout.fillWidth: true
-          spacing: Style.space(10)
-          Text {
-            text: "Enabled"
-            color: root.barForeground
-            font.family: root.bar ? root.bar.fontFamily : "sans"
-            font.pixelSize: Style.font.body
-            Layout.fillWidth: true
-          }
-          ToggleSwitch {
-            checked: root.running
-            // ToggleSwitch is a controlled component: toggled() passes no
-            // value and it never mutates `checked` itself, so flip the real
-            // state. Passing `checked` here would be a no-op.
-            onToggled: root.setRunning(!root.running)
-          }
-        }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(10)
-          Text {
-            text: "React to audio"
-            color: root.barForeground
-            font.family: root.bar ? root.bar.fontFamily : "sans"
-            font.pixelSize: Style.font.body
-            Layout.fillWidth: true
-          }
-          ToggleSwitch {
-            checked: root.audio
-            onToggled: root.setAudio(!root.audio)
-          }
-        }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(10)
-          Text {
-            text: "Show FPS"
-            color: root.barForeground
-            font.family: root.bar ? root.bar.fontFamily : "sans"
-            font.pixelSize: Style.font.body
-            Layout.fillWidth: true
-          }
-          ToggleSwitch {
-            checked: root.showFps
-            onToggled: root.setShowFps(!root.showFps)
-          }
+          spacing: Style.space(6)
+          Text { text: "On"; color: root.barForeground; font.family: root.bar ? root.bar.fontFamily : "sans"; font.pixelSize: Style.font.body }
+          // ToggleSwitch is controlled: toggled() passes no value, so flip the real state.
+          ToggleSwitch { checked: root.running; onToggled: root.setRunning(!root.running) }
+          Text { text: "Audio"; color: root.barForeground; font.family: root.bar ? root.bar.fontFamily : "sans"; font.pixelSize: Style.font.body; Layout.leftMargin: Style.space(8) }
+          ToggleSwitch { checked: root.audio; onToggled: root.setAudio(!root.audio) }
+          Text { text: "FPS"; color: root.barForeground; font.family: root.bar ? root.bar.fontFamily : "sans"; font.pixelSize: Style.font.body; Layout.leftMargin: Style.space(8) }
+          ToggleSwitch { checked: root.showFps; onToggled: root.setShowFps(!root.showFps) }
+          Item { Layout.fillWidth: true }
         }
 
         PanelSectionHeader { text: "BACKGROUNDS" }
@@ -223,7 +201,7 @@ Panel {
         // Enabled set with per-effect toggle, 2 per row so the whole catalog fits
         // without making the panel too tall; >1 enabled => rotates (see ROTATION).
         GridLayout {
-          columns: 2
+          columns: 3
           Layout.fillWidth: true
           columnSpacing: Style.space(10)
           rowSpacing: Style.space(6)
@@ -250,7 +228,7 @@ Panel {
 
         // Vendored ttfx effects; same pick + rotation-toggle as the built-ins.
         GridLayout {
-          columns: 2
+          columns: 3
           Layout.fillWidth: true
           columnSpacing: Style.space(10)
           rowSpacing: Style.space(6)
@@ -300,7 +278,7 @@ Panel {
           }
         }
 
-        PanelSectionHeader { text: "SECONDS PER BACKGROUND" }
+        PanelSectionHeader { text: "SECONDS PER BACKGROUND  ·  " + root.rotateSecs }
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
@@ -309,7 +287,7 @@ Panel {
           onMoved: function(v) { root.setRotateSecs(v) }
         }
 
-        PanelSectionHeader { text: "INTENSITY" }
+        PanelSectionHeader { text: "INTENSITY  ·  " + root.intensity }
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
@@ -318,7 +296,7 @@ Panel {
           onMoved: function(v) { root.setIntensity(v) }
         }
 
-        PanelSectionHeader { text: "RESOLUTION" }
+        PanelSectionHeader { text: "RESOLUTION  ·  " + root.resolution }
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
@@ -328,17 +306,17 @@ Panel {
           onMoved: function(v) { root.setResolution(v) }
         }
 
-        PanelSectionHeader { text: "AUDIO REACTIVITY" }
+        PanelSectionHeader { text: "AUDIO REACTIVITY  ·  " + root.reactivity }
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar
-          // How strongly ttfx effects speed up with the music. 0 = off, 2 = normal, 5 = strong.
-          minimum: 0; maximum: 5; step: 1; integer: true
+          // How strongly ttfx effects speed up with the music. 0 = off, 3 = up to triple speed.
+          minimum: 0; maximum: 3; step: 1; integer: true
           value: root.reactivity
           onMoved: function(v) { root.setReactivity(v) }
         }
 
-        PanelSectionHeader { text: "INTRO TEXT SIZE" }
+        PanelSectionHeader { text: "INTRO TEXT SIZE  ·  " + root.introSize }
         PanelSlider {
           Layout.fillWidth: true
           bar: root.bar

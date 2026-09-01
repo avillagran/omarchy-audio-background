@@ -283,8 +283,17 @@ fn main() -> Result<()> {
                     || cfg.restart != old.restart
                     || cfg.intro_size != old.intro_size
                     || cfg.show_fps != old.show_fps;
+                // Rebuild only when a structural/visual field actually changed. Changing
+                // a slider (intensity, reactivity — the latter is applied live by the
+                // renderer) or a rotation toggle should NOT replay the boot intro (that's
+                // the jarring "restart" the user sees). Intro only on a real effect switch,
+                // explicit restart, or an intro-affecting field (byline/intro_size).
+                let intro = cfg.effect != old.effect
+                    || cfg.restart != old.restart
+                    || cfg.intro_size != old.intro_size
+                    || cfg.byline != old.byline;
                 if visual {
-                    rebuild_layers(&w, &b, &cfg, &ae.borrow(), true);
+                    rebuild_layers(&w, &b, &cfg, &ae.borrow(), intro);
                 }
             }
             glib::ControlFlow::Continue
@@ -943,6 +952,10 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     let (mut cols, mut rows) = settle_pty_size(cols, rows);
     let fps = 60i64;
     let frame_secs = 1.0 / fps as f64;
+    // reactivity is live-adjustable: the frame loop re-reads state.json so a slider
+    // change applies WITHOUT restarting the background (no respawn, no intro replay).
+    let mut reactivity = reactivity;
+    let mut frames = 0u32;
     loop {
         // Build the effect with default config via the clap parser (like upstream's
         // --random-effect), then drive it ourselves so we can pace it by audio.
@@ -972,11 +985,21 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             // Stop if the PTY went away (effect settled / terminal gone).
             let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
             if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
-            // Pace by the live audio level, scaled by the user's reactivity setting:
-            // louder => smaller delay => faster animation. reactivity 0 disables it.
+            // Live config poll (~every 45 frames): apply reactivity changes without a
+            // restart; on a structural change (effect picked / turned off) exit so the
+            // controller respawns us with the new effect.
+            frames += 1;
+            if frames % 45 == 0 {
+                let live = read_config();
+                reactivity = live.reactivity;
+                if live.effect != effect_name || !live.running { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
+            }
+            // Pace by the live audio level, scaled by the user's reactivity setting.
+            // Louder => smaller delay => faster animation, capped at 3x (triple).
+            // reactivity 0 disables it; higher reactivity reaches the cap more easily.
             let vol = audio.volume().clamp(0.0, 1.0);
-            let boost = (vol * 3.0 + if audio.beat() { 1.5 } else { 0.0 }) * (reactivity as f32 / 2.0);
-            let speed = if audio_enabled && reactivity > 0 { 1.0 + boost } else { 1.0 };
+            let boost = vol * reactivity as f32 + if audio.beat() { 0.5 } else { 0.0 };
+            let speed = if audio_enabled && reactivity > 0 { (1.0 + boost).clamp(1.0, 3.0) } else { 1.0 };
             thread::sleep(Duration::from_secs_f64(frame_secs / speed as f64));
         }
         let _ = ctx.terminal.restore_cursor(&mut out, "\n");
