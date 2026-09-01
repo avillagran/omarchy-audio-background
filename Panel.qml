@@ -82,6 +82,12 @@ Panel {
     if (list.length === 0) return // never empty
     root.effects = list
     write("effect" + (on ? "+" : "-") + e)
+    // If the currently displayed effect was just disabled, switch to first enabled
+    if (!on && root.effect === e) {
+      var next = list[0]
+      root.effect = next
+      write("effect=" + next)
+    }
   }
 
   Component.onCompleted: root.refresh()

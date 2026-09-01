@@ -216,8 +216,9 @@ fn main() -> Result<()> {
     let windows: Rc<RefCell<Vec<gtk4::ApplicationWindow>>> = Rc::new(RefCell::new(Vec::new()));
     let cfg0 = read_config();
     let active_effect: Rc<RefCell<String>> = Rc::new(RefCell::new(
-        // Honor a picked effect even if it isn't in the rotation set.
-        if is_valid_effect(&cfg0.effect) { cfg0.effect.clone() }
+        // Only honor the saved effect if it's still enabled in the rotation set.
+        // Otherwise the user disabled it — start with the first enabled one.
+        if is_valid_effect(&cfg0.effect) && cfg0.effects.contains(&cfg0.effect) { cfg0.effect.clone() }
         else { cfg0.effects.first().cloned().unwrap_or_else(|| "matrix".into()) }
     ));
     let last_cfg: Rc<RefCell<Config>> = Rc::new(RefCell::new(cfg0));
@@ -266,9 +267,14 @@ fn main() -> Result<()> {
             if changed {
                 let old = lc.borrow().clone();
                 // If the active-effect selection changed, honor it; otherwise
-                // keep rotating from where we are.
-                if cfg.effect != old.effect && is_valid_effect(&cfg.effect) {
+                // keep rotating from where we are. Only honor if still enabled.
+                if cfg.effect != old.effect && is_valid_effect(&cfg.effect) && cfg.effects.contains(&cfg.effect) {
                     *ae.borrow_mut() = cfg.effect.clone();
+                } else if !cfg.effects.contains(&ae.borrow().clone()) {
+                    // Active effect was disabled via toggle — jump to first enabled.
+                    if let Some(first) = cfg.effects.first() {
+                        *ae.borrow_mut() = first.clone();
+                    }
                 }
                 *lc.borrow_mut() = cfg.clone();
                 // boot_between / rotate_secs are read live by the rotation timer, so a
@@ -313,10 +319,20 @@ fn main() -> Result<()> {
         glib::timeout_add_local(Duration::from_secs(1), move || {
             let cfg = lc.borrow().clone();
             if cfg.running && cfg.effects.len() > 1 {
+                // If the currently displayed effect was just disabled, switch immediately
+                // instead of waiting for the full interval (otherwise a disabled
+                // effect stays visible for up to rotate_secs).
+                let cur = ae.borrow().clone();
+                if !cfg.effects.contains(&cur) {
+                    let next = cfg.effects[0].clone();
+                    *ae.borrow_mut() = next.clone();
+                    elapsed.set(0);
+                    rebuild_layers(&w, &b, &cfg, &next, false);
+                    return glib::ControlFlow::Continue;
+                }
                 let e = elapsed.get() + 1;
                 if e >= cfg.rotate_secs.clamp(3, 3600) as u64 {
                     elapsed.set(0);
-                    let cur = ae.borrow().clone();
                     let next = match cfg.effects.iter().position(|x| *x == cur) {
                         Some(i) => cfg.effects[(i + 1) % cfg.effects.len()].clone(),
                         None => cfg.effects[0].clone(),
