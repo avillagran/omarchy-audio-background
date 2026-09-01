@@ -79,7 +79,7 @@ PanelWindow {
       x = screenW - barW - contentWidth - gap
       y = anchorScreenPos.y + anchorH / 2 - contentHeight / 2
     } else {
-      x = anchorScreenPos.x + anchorW / 2 - contentWidth / 2
+      x = anchorScreenPos.x
       y = barH + gap
     }
     x = Math.max(margin, Math.min(x, screenW - contentWidth - margin))

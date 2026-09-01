@@ -982,6 +982,32 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
         let mut out = stdout.lock();
         if ctx.terminal.prep_canvas(&mut out).is_err() { return Ok(()); }
         loop {
+            // Audio-reactive color: bass -> hue shift, volume -> brightness. Same
+            // reactivity slider that drives speed: 0=off, 3=triple. Applied in the
+            // global sgr_color hook so every ttfx effect recolors without per-effect
+            // patches. This is the bridge (vendored engine) - no upstream PR needed.
+            {
+                let vol = audio.volume().clamp(0.0, 1.0);
+                let bass = (audio.band_at(0, NBANDS) + audio.band_at(1, NBANDS) * 0.5).clamp(0.0, 1.0);
+                let active = audio_enabled && reactivity > 0 && (vol > 0.02 || bass > 0.05);
+                if active {
+                    // Brightness 1.0..1.5 (reactivity 3 = stronger), hue up to ~60 deg from bass + vol.
+                    let bright = 1.0 + vol * 0.45 * (reactivity as f32 / 2.0);
+                    let hue_deg = (bass * 45.0 + vol * 18.0) * (reactivity as f32 / 2.0) + if audio.beat() { 10.0 } else { 0.0 };
+                    let rad = hue_deg.to_radians();
+                    let (c, s) = (rad.cos(), rad.sin());
+                    let t = 1.0 - c;
+                    let w1 = 0.57735026; // 1/sqrt(3) for hue rotation around gray axis
+                    let m = [
+                        c + t/3.0,          t/3.0 - w1*s,       t/3.0 + w1*s,
+                        t/3.0 + w1*s,       c + t/3.0,          t/3.0 - w1*s,
+                        t/3.0 - w1*s,       t/3.0 + w1*s,       c + t/3.0,
+                    ];
+                    ttfx::utils::ansi::set_audio_color(true, bright, m);
+                } else {
+                    ttfx::utils::ansi::set_audio_color(false, 1.0, [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]);
+                }
+            }
             // Stop if the PTY went away (effect settled / terminal gone).
             let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
             if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
