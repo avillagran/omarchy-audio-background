@@ -2,6 +2,8 @@
 
 [![Demo del Omarchy Audio Background en X / Twitter](preview.png)](https://x.com/avillagran/status/2094998179628409318?s=20)
 
+> **NOTE:** There are bugs. Please report them!
+
 Animated, audio-reactive **desktop background** for [Omarchy](https://omarchy.org) / Hyprland, controlled from the Omarchy bar. It renders as a real Wayland `layer-shell` background that lives *below* app windows and the bar.
 
 ## Install
