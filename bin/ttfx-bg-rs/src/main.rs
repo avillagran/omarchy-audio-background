@@ -1406,16 +1406,16 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
     let mut prev_head: Vec<i32> = head.clone();
     let mut speed: Vec<i32> = (0..cols).map(|_| rng.gen_range(speed_base..speed_base + 2).max(1)).collect();
     let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(trail_base..trail_base + 12)).collect();
-    // When the theme changes, the HEAD of every drop (the fresh character
-    // entering at the top) immediately uses the CURRENT palette, while each
-    // trail cell keeps the color it already had (stored per-cell). Old rain
-    // lingers in its old hue and new rain arrives in the new hue — a visible
-    // two-color mix toggling in real time, no respawn wait, no flash.
+    // When the theme changes, only drops that RESPAWN after the change adopt the
+    // new palette; drops already on screen keep their born color until they
+    // scroll away. Each column's trail is painted entirely from its born palette
+    // so every cell always has a real hue (never the white default foreground).
     let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut col_pal: Vec<Vec<String>> = (0..cols).map(|_| palette.to_vec()).collect();
     let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        // Detect theme changes live and switch the head palette immediately.
+        // Detect theme changes live and update the palette future drops use.
         if use_theme_colors {
             let new_colors = read_theme_colors();
             if !new_colors.is_empty() {
@@ -1456,22 +1456,21 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
         let band = |c: usize| audio.band_at(c, cols);
         for c in 0..cols {
             let h = head[c];
-            // Head (t=0) uses the CURRENT palette -> new color the instant the
-            // theme changes. Trail keeps the color already stored -> old hue
-            // persists until that drop scrolls away.
+            // Paint this column's drop entirely with ITS born palette.
+            let pal = &col_pal[c];
             for t in 0..trail[c] {
                 let y = h - t as i32;
                 if y >= 0 && y < rows as i32 {
                     let ch = chars[rng.gen_range(0..chars.len())];
-                    let color = if t == 0 {
-                        tint_to_color(1, &cur_pal)
-                    } else {
-                        scr.get_color(c, y as usize) // keep this cell's old color
-                    };
+                    let idx = if t == 0 { 0 } else if t < 4 { 1 } else { 2 };
+                    let idx = idx.min(pal.len().saturating_sub(1));
+                    // fall back to a neutral theme hue if palette is empty
+                    let color = pal.get(idx).cloned().filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "\x1b[32m".to_string());
                     scr.put(c, y as usize, ch, color);
                 }
             }
-            // Advance drop; spawn sets a fresh trail head that uses cur_pal.
+            // Advance drop; on respawn adopt the current theme palette.
             prev_head[c] = h;
             head[c] = h + speed[c] + (band(c) * 2.0) as i32;
             if head[c] - trail[c] as i32 > rows as i32 {
@@ -1479,6 +1478,7 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
                     head[c] = -(rng.gen_range(0..30));
                     speed[c] = rng.gen_range(speed_base..speed_base + 2).max(1);
                     trail[c] = rng.gen_range(trail_base..trail_base + 12);
+                    col_pal[c] = cur_pal.clone();
                 } else {
                     head[c] = -(rows as i32 + 10);
                 }
