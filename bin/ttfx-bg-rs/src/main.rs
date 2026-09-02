@@ -1364,12 +1364,12 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
     loop {
         let pal: &[String] = &palette;
         let res = match effect {
-            "donut" => fx_donut(&mut scr, pal, intensity, &state, cell_aspect),
-            "fire" => fx_fire(&mut scr, pal, intensity, &state),
-            "starfield" => fx_starfield(&mut scr, pal, intensity, &state),
-            "life" => fx_life(&mut scr, pal, intensity, &state),
-            "wave" => fx_wave(&mut scr, pal, intensity, &state),
-            "bars" => fx_bars(&mut scr, pal, intensity, &state),
+            "donut" => fx_donut(&mut scr, pal, intensity, &state, cell_aspect, cfg.use_theme_colors, effect),
+            "fire" => fx_fire(&mut scr, pal, intensity, &state, cfg.use_theme_colors, effect),
+            "starfield" => fx_starfield(&mut scr, pal, intensity, &state, cfg.use_theme_colors, effect),
+            "life" => fx_life(&mut scr, pal, intensity, &state, cfg.use_theme_colors, effect),
+            "wave" => fx_wave(&mut scr, pal, intensity, &state, cfg.use_theme_colors, effect),
+            "bars" => fx_bars(&mut scr, pal, intensity, &state, cfg.use_theme_colors, effect),
             _ => fx_matrix(&mut scr, pal, intensity, &state, effect == "rain", cfg.use_theme_colors, effect),
         };
         if let Err(e) = res {
@@ -1491,10 +1491,25 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
 }
 
 // --- wave: layered sine waves scrolling horizontally ---
-fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     let mut t = 0f32;
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         scr.clear_dirty();
         let lv = audio.volume();
         let (cols, rows) = (scr.cols, scr.rows);
@@ -1506,7 +1521,7 @@ fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
             for x in 0..cols {
                 let y = cy + amp * (x as f32 * freq + phase).sin();
                 if y >= 0.0 && (y as usize) < rows {
-                    scr.put(x, y as usize, if layer == 0 { '~' } else { '-' }, tint_to_color(layer + 1, palette));
+                    scr.put(x, y as usize, if layer == 0 { '~' } else { '-' }, tint_to_color(layer + 1, &cur_pal));
                 }
             }
         }
@@ -1519,24 +1534,39 @@ fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
 
 // --- bars: equalizer driven by the REAL per-band spectrum (each bar = one
 // frequency band's energy), smoothed so it follows without flicker. ---
-fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     let bands = NBANDS;
     let mut heights = vec![0f32; bands];
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         scr.clear_dirty();
         let (cols, rows) = (scr.cols, scr.rows);
         let maxh = rows as f32 * 0.9;
         let bw = cols / bands.max(1);
         for b in 0..bands {
-            let energy = audio.band_at(b * (cols / bands.max(1)), cols); // band b
+            let energy = audio.band_at(b * (cols / bands.max(1)), cols);
             let target = (energy * 1.1).min(1.0) * maxh;
-            heights[b] += (target - heights[b]) * 0.4; // smooth attack/release
+            heights[b] += (target - heights[b]) * 0.4;
             let h = heights[b] as usize;
             for y in 0..h.min(rows) {
                 let tint = if y as f32 > h as f32 * 0.7 { 1 } else if y as f32 > h as f32 * 0.4 { 2 } else { 3 };
                 for x in 0..bw.saturating_sub(1) {
-                    scr.put(b * bw + x, rows - 1 - y, '#', tint_to_color(tint, palette));
+                    scr.put(b * bw + x, rows - 1 - y, '#', tint_to_color(tint, &cur_pal));
                 }
             }
         }
@@ -1550,7 +1580,7 @@ fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
 // Scale follows the original donut.c proportions (30/80 horizontal, 15/22
 // vertical), which already bake in the terminal cell aspect. That keeps the
 // torus round on any screen; compressing by cell_aspect over-flattened it.
-fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, cell_aspect: f32) -> Result<()> {
+fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, cell_aspect: f32, use_theme_colors: bool, effect: &str) -> Result<()> {
     let _ = cell_aspect;
     let mut a = 0f32;
     let mut e = 1f32;
@@ -1560,8 +1590,23 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
     let sx = cols as f32 * (30.0 / 80.0);
     let sy = rows as f32 * (15.0 / 22.0);
     let mut zbuf = vec![0f32; cols * rows];
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         scr.clear_dirty();
         for b in zbuf.iter_mut() { *b = 0.0; }
         let lv = audio.volume();
@@ -1585,7 +1630,7 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
                     let ci2 = lum.max(0.0) as usize;
                     let ch = chars[ci2.min(chars.len() - 1)] as char;
                     let tint = if ci2 > 8 { 1 } else if ci2 > 4 { 2 } else { 3 };
-                    scr.put(x as usize, y as usize, ch, tint_to_color(tint, palette));
+                    scr.put(x as usize, y as usize, ch, tint_to_color(tint, &cur_pal));
                 }
                 i += 0.02;
             }
@@ -1601,16 +1646,30 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
 }
 
 // --- fire: classic doom fire from the bottom row. Height licks with audio. ---
-fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
     let palette_chars: Vec<char> = " .:-=+*#%@".chars().collect();
     let mut heat = vec![vec![0u8; cols]; rows];
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         let lv = audio.volume();
-        // bottom row: fuel, fanned by the audio level
         let fuel = (28.0 + lv * 8.0 + intensity as f32 * 0.4) as u8;
         for x in 0..cols { heat[rows - 1][x] = fuel.min(36); }
         for y in 0..rows - 1 {
@@ -1627,7 +1686,7 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 if h > 0 {
                     let ci = (h * palette_chars.len() / 37).min(palette_chars.len() - 1);
                     let tint = if h > 24 { 1 } else if h > 12 { 2 } else { 3 };
-                    scr.put(x, y, palette_chars[ci], tint_to_color(tint, palette));
+                    scr.put(x, y, palette_chars[ci], tint_to_color(tint, &cur_pal));
                 }
             }
         }
@@ -1638,7 +1697,7 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
 }
 
 // --- starfield: stars flying outward from the center. Speed follows audio. ---
-fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -1648,8 +1707,23 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
     let mut stars: Vec<(f32, f32, f32)> = (0..n).map(|_| (
         rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(0.05..1.0),
     )).collect();
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         scr.clear_dirty();
         let lv = audio.volume();
         let speed = (0.006 + intensity as f32 * 0.0012) * (1.0 + lv * 2.2);
@@ -1661,7 +1735,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
             if px >= 0.0 && px < cols as f32 && py >= 0.0 && py < rows as f32 {
                 let depth = 1.0 - s.2;
                 let (ch, tint) = if depth > 0.75 { ('@', 1) } else if depth > 0.45 { ('*', 2) } else { ('.', 3) };
-                scr.put(px as usize, py as usize, ch, tint_to_color(tint, palette));
+                scr.put(px as usize, py as usize, ch, tint_to_color(tint, &cur_pal));
             }
         }
         scr.fps_overlay();
@@ -1671,7 +1745,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
 }
 
 // --- life: Conway's Game of Life, reseeded on stagnation ---
-fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -1681,15 +1755,30 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
     let density = 0.18 + audio.volume() * 0.1;
     for y in 0..rows { for x in 0..cols { grid[y][x] = rng.gen::<f32>() < density; } }
     let mut stagnant = 0u32;
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         scr.clear_dirty();
         for y in 0..rows {
             for x in 0..cols {
                 if grid[y][x] {
                     age[y][x] = age[y][x].saturating_add(1);
                     let tint = if age[y][x] > 30 { 1 } else if age[y][x] > 8 { 2 } else { 3 };
-                    scr.put(x, y, if age[y][x] > 8 { 'O' } else { 'o' }, tint_to_color(tint, palette));
+                    scr.put(x, y, if age[y][x] > 8 { 'O' } else { 'o' }, tint_to_color(tint, &cur_pal));
                 } else {
                     age[y][x] = 0;
                 }
