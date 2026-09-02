@@ -33,6 +33,10 @@ Panel {
   property int reactivity: 2
   property string byline: ""
   property string label: "♪"
+  property bool collapsed: false
+  property real panelOpacity: 0.6
+  property point dragOffset: Qt.point(0, 0)
+  property bool introBeatSync: true
 
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   // Vendored ttfx effects (rendered by the ttfx engine). matrix/rain stay hand-rolled
@@ -65,12 +69,21 @@ Panel {
     write("intro_size=" + v)
     introReplay.restart()   // the intro renders once at startup; replay it at the new size (debounced)
   }
+  function setIntroBeatSync(v) { root.introBeatSync = v; write("intro_beat_sync=" + (v ? "1" : "0")) }
   function setByline(t)    { root.byline = t;    write("byline="    + t); }
-  // Cycle the active effect across the full catalog (built-ins + ttfx) with ◀ ▶.
+  function setPanelOpacity(v) { root.panelOpacity = v; write("panel_opacity=" + v); }
+  // When true, use the active Omarchy theme colors for the effect palettes instead
+  // of the built-in hardcoded colors. Requires omarchy-theme-current to be installed.
+  property bool useThemeColors: false
+  function setUseThemeColors(v) { root.useThemeColors = v; write("use_theme_colors=" + (v ? "1" : "0")) }
+  function toggleCollapsed() { root.collapsed = !root.collapsed; if (!root.collapsed) root.dragOffset = Qt.point(0,0) }
+  // Cycle the active effect across the ENABLED set only (the user's selection).
+  // Built-ins + ttfx combined catalog is for the grid UI, NOT for cycling.
   function cycleEffect(dir) {
-    var list = root.allEffects.concat(root.ttfxEffects)
+    var list = root.effects
+    if (!list || list.length === 0) return // nothing enabled
     var i = list.indexOf(root.effect)
-    if (i < 0) i = 0
+    if (i < 0) { i = 0; root.pickEffect(list[0]); return }
     i = (i + dir + list.length) % list.length
     root.pickEffect(list[i])
   }
@@ -112,7 +125,18 @@ Panel {
           if (typeof s.running === "boolean") root.running = s.running
           if (typeof s.audio === "boolean")   root.audio = s.audio
           if (typeof s.show_fps === "boolean") root.showFps = s.show_fps
-          if (typeof s.effect === "string")   root.effect = s.effect
+          if (typeof s.effect === "string" && s.effect.trim() !== "") {
+            root.effect = s.effect
+            // Validate: if the effect isn't in the enabled list, fall back to the first enabled
+            if (root.effects.indexOf(root.effect) < 0 && root.effects.length > 0) {
+              root.effect = root.effects[0]
+              write("effect=" + root.effect)
+            }
+          } else if (root.effects && root.effects.length > 0 && root.effects.indexOf(root.effect) < 0) {
+            // State has empty/invalid effect; sync to first enabled
+            root.effect = root.effects[0]
+            write("effect=" + root.effect)
+          }
           if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.intensity === "number") root.intensity = s.intensity
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
@@ -122,6 +146,9 @@ Panel {
           if (typeof s.reactivity === "number") root.reactivity = s.reactivity
           if (typeof s.ttfx_text === "string" && s.ttfx_text.trim() !== "") root.ttfxText = s.ttfx_text
           if (typeof s.byline === "string")   root.byline = s.byline
+          if (typeof s.panel_opacity === "number") root.panelOpacity = Math.max(0.15, Math.min(1.0, s.panel_opacity))
+          if (typeof s.intro_beat_sync === "boolean") root.introBeatSync = s.intro_beat_sync
+          if (typeof s.use_theme_colors === "boolean") root.useThemeColors = s.use_theme_colors
         } catch (e) {}
       }
     }
@@ -134,6 +161,8 @@ Panel {
     function toggle(): void { root.toggle() }
   }
 
+  onOpenedChanged: { if (root.opened) root.dragOffset = Qt.point(0, 0) }
+
   CardWindow {
     id: panel
     anchorItem: root.anchorItem
@@ -141,21 +170,21 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: false  // anchor under the bar widget (like KeyboardPanel's default), not centered
-    contentWidth: panel.fittedContentWidth(Style.space(560))
+    dragOffset: root.dragOffset
+    contentWidth: root.collapsed ? panel.fittedContentWidth(Style.space(420)) : panel.fittedContentWidth(Style.space(560))
     // Height must follow the content or the card stays short and the taller layout
     // overflows below it (controls rendered on bare desktop with no card behind them).
-    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
+    contentHeight: root.collapsed ? panel.fittedContentHeight(collapsedRow.implicitHeight) : panel.fittedContentHeight(contentColumn.implicitHeight)
     focusTarget: keyCatcher
 
-    // Translucent card (0.6 opacity) so the animated background shows through. This is
-    // why we use CardWindow instead of KeyboardPanel (whose card is hardcoded opaque).
+    // Translucent card so the animated background shows through. Opacity via slider.
     Rectangle {
       id: cardSurface
       anchors.fill: parent
       radius: Style.cornerRadius
       border.color: Color.popups.border
       border.width: 1
-      color: Qt.rgba(Color.popups.background.r, Color.popups.background.g, Color.popups.background.b, 0.6)
+      color: Qt.rgba(Color.popups.background.r, Color.popups.background.g, Color.popups.background.b, root.panelOpacity)
     }
 
     PanelKeyCatcher {
@@ -169,8 +198,28 @@ Panel {
         id: contentColumn
         width: parent.width
         spacing: Style.space(12)
+        visible: !root.collapsed
 
-        PanelSectionHeader { text: "AUDIO BACKGROUND" }
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+          // Drag handle — drag the header to move the panel (resets on reopen)
+          Item {
+            Layout.fillWidth: true
+            height: headerText.implicitHeight
+            PanelSectionHeader { id: headerText; text: "AUDIO BACKGROUND"; anchors.verticalCenter: parent.verticalCenter }
+            MouseArea {
+              anchors.fill: parent
+              acceptedButtons: Qt.LeftButton
+              cursorShape: Qt.SizeAllCursor
+              property point startPos
+              property point startOffset
+              onPressed: (mouse) => { startPos = Qt.point(mouse.x, mouse.y); startOffset = root.dragOffset }
+              onPositionChanged: (mouse) => { if (pressed) root.dragOffset = Qt.point(startOffset.x + mouse.x - startPos.x, startOffset.y + mouse.y - startPos.y) }
+            }
+          }
+          Button { text: "—"; onClicked: root.toggleCollapsed() } // collapse to mini
+        }
 
         // Main toggles in one compact row (short labels so three fit across).
         RowLayout {
@@ -284,51 +333,72 @@ Panel {
           }
         }
 
-        PanelSectionHeader { text: "SECONDS PER BACKGROUND  ·  " + root.rotateSecs }
-        PanelSlider {
+        // Sliders organized 3 per row for a compact layout
+        GridLayout {
+          columns: 3
           Layout.fillWidth: true
-          bar: root.bar
-          minimum: 3; maximum: 120; step: 1; integer: true
-          value: root.rotateSecs
-          onMoved: function(v) { root.setRotateSecs(v) }
-        }
+          columnSpacing: Style.space(10)
+          rowSpacing: Style.space(6)
 
-        PanelSectionHeader { text: "INTENSITY  ·  " + root.intensity }
-        PanelSlider {
-          Layout.fillWidth: true
-          bar: root.bar
-          minimum: 0; maximum: 10; step: 1; integer: true
-          value: root.intensity
-          onMoved: function(v) { root.setIntensity(v) }
-        }
+          // Row 1: Seconds | Intensity | Resolution
+          ColumnLayout {
+            Layout.fillWidth: true
+            PanelSectionHeader { text: "SECONDS  ·  " + root.rotateSecs }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 3; maximum: 120; step: 1; integer: true
+              value: root.rotateSecs
+              onMoved: function(v) { root.setRotateSecs(v) }
+            }
+          }
+          ColumnLayout {
+            Layout.fillWidth: true
+            PanelSectionHeader { text: "INTENSITY  ·  " + root.intensity }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 0; maximum: 10; step: 1; integer: true
+              value: root.intensity
+              onMoved: function(v) { root.setIntensity(v) }
+            }
+          }
+          ColumnLayout {
+            Layout.fillWidth: true
+            PanelSectionHeader { text: "RESOLUTION  ·  " + root.resolution }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 1; maximum: 4; step: 1; integer: true
+              value: root.resolution
+              onMoved: function(v) { root.setResolution(v) }
+            }
+          }
 
-        PanelSectionHeader { text: "RESOLUTION  ·  " + root.resolution }
-        PanelSlider {
-          Layout.fillWidth: true
-          bar: root.bar
-          // 1 = full-res (most CPU); higher = coarser cells = less CPU (old machines).
-          minimum: 1; maximum: 4; step: 1; integer: true
-          value: root.resolution
-          onMoved: function(v) { root.setResolution(v) }
-        }
-
-        PanelSectionHeader { text: "AUDIO REACTIVITY  ·  " + root.reactivity }
-        PanelSlider {
-          Layout.fillWidth: true
-          bar: root.bar
-          // How strongly ttfx effects speed up with the music. 0 = off, 3 = up to triple speed.
-          minimum: 0; maximum: 3; step: 1; integer: true
-          value: root.reactivity
-          onMoved: function(v) { root.setReactivity(v) }
-        }
-
-        PanelSectionHeader { text: "INTRO TEXT SIZE  ·  " + root.introSize }
-        PanelSlider {
-          Layout.fillWidth: true
-          bar: root.bar
-          minimum: 1; maximum: 3; step: 1; integer: true
-          value: root.introSize
-          onMoved: function(v) { root.setIntroSize(v) }
+          // Row 2: Audio Reactivity | Intro Text Size | (spacer)
+          ColumnLayout {
+            Layout.fillWidth: true
+            PanelSectionHeader { text: "AUDIO REACT  ·  " + root.reactivity }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 0; maximum: 3; step: 1; integer: true
+              value: root.reactivity
+              onMoved: function(v) { root.setReactivity(v) }
+            }
+          }
+          ColumnLayout {
+            Layout.fillWidth: true
+            PanelSectionHeader { text: "INTRO SIZE  ·  " + root.introSize }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 1; maximum: 3; step: 1; integer: true
+              value: root.introSize
+              onMoved: function(v) { root.setIntroSize(v) }
+            }
+          }
+          Item { Layout.fillWidth: true } // spacer for the 3rd column
         }
 
         PanelSectionHeader { text: "INTRO BYLINE" }
@@ -344,6 +414,58 @@ Panel {
             root.setByline(text === defaultByline ? "" : text)
           }
         }
+
+        PanelSectionHeader { text: "INTRO AL RITMO  ·  " + (root.introBeatSync ? "ON" : "OFF") }
+        ToggleSwitch {
+          checked: root.introBeatSync
+          onToggled: root.setIntroBeatSync(!root.introBeatSync)
+        }
+
+        PanelSectionHeader { text: "USAR COLORES DEL TEMA  ·  " + (root.useThemeColors ? "ON" : "OFF") }
+        ToggleSwitch {
+          checked: root.useThemeColors
+          onToggled: root.setUseThemeColors(!root.useThemeColors)
+        }
+
+        PanelSectionHeader { text: "PANEL TRANSPARENCY  ·  " + Math.round(root.panelOpacity*100) + "%" }
+        PanelSlider {
+          Layout.fillWidth: true
+          bar: root.bar
+          minimum: 15; maximum: 100; step: 5; integer: true
+          value: Math.round(root.panelOpacity*100)
+          onMoved: function(v) { root.setPanelOpacity(v/100) }
+        }
+      }
+
+      RowLayout {
+        id: collapsedRow
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.collapsed
+        Button { text: "◀"; onClicked: root.cycleEffect(-1) }
+        Item {
+          Layout.fillWidth: true
+          height: effectText.implicitHeight
+          Text {
+            id: effectText
+            anchors.centerIn: parent
+            text: root.effect
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : "sans"
+            font.pixelSize: Style.font.body
+          }
+          MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            cursorShape: Qt.SizeAllCursor
+            property point startPos
+            property point startOffset
+            onPressed: (mouse) => { startPos = Qt.point(mouse.x, mouse.y); startOffset = root.dragOffset }
+            onPositionChanged: (mouse) => { if (pressed) root.dragOffset = Qt.point(startOffset.x + mouse.x - startPos.x, startOffset.y + mouse.y - startPos.y) }
+          }
+        }
+        Button { text: "▶"; onClicked: root.cycleEffect(1) }
+        Button { text: "⛶"; onClicked: root.toggleCollapsed() }
       }
     }
   }

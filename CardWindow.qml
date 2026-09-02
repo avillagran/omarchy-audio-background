@@ -24,6 +24,7 @@ PanelWindow {
   property int margin: Style.gapsOut
   property int padding: Style.space(12)
   property Item focusTarget: null
+  property point dragOffset: Qt.point(0, 0)
 
   // REAL transparency: the window itself is transparent.
   color: "transparent"
@@ -82,6 +83,8 @@ PanelWindow {
       x = anchorScreenPos.x
       y = barH + gap
     }
+    x += dragOffset.x
+    y += dragOffset.y
     x = Math.max(margin, Math.min(x, screenW - contentWidth - margin))
     y = Math.max(margin, Math.min(y, screenH - contentHeight - margin))
     return Qt.point(Math.round(x), Math.round(y))

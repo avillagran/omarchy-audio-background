@@ -19,7 +19,7 @@ mkdir -p "$(dirname "$STATE")"
 
 # current values (defaults match the Rust binary)
 running="true"; audio="true"; effect="matrix"; intensity="5"; byline=""; restart="0"; intro_size="2"; show_fps="false"
-boot_between="true"; rotate_secs="20"; ttfx_text="OMARCHY"; resolution="1"; reactivity="2"
+boot_between="true"; rotate_secs="20"; ttfx_text="OMARCHY"; resolution="1"; reactivity="2"; panel_opacity="0.6"
 effects="matrix rain wave bars donut fire starfield life"
 
 if [ -f "$STATE" ]; then
@@ -30,7 +30,7 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"audio"[^,}]*' "$STATE" || true);     [ -n "$v" ] && audio=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"show_fps"[^,}]*' "$STATE" || true);  [ -n "$v" ] && show_fps=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"boot_between"[^,}]*' "$STATE" || true); [ -n "$v" ] && boot_between=$(echo "$v" | grep -o '\(true\|false\)')
-  v=$(grep -o '"effect":[^,}]*' "$STATE" || true);    [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
+  v=$(grep -o '"effect":[^,}]*"[^"]*"' "$STATE" || true); [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*"://; s/".*//')
   v=$(grep -o '"intensity"[^,}]*' "$STATE" || true); [ -n "$v" ] && intensity=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"restart"[^,}]*' "$STATE" || true);   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"intro_size"[^,}]*' "$STATE" || true); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]\+')
@@ -38,8 +38,15 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"resolution"[^,}]*' "$STATE" || true); [ -n "$v" ] && resolution=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"reactivity"[^,}]*' "$STATE" || true); [ -n "$v" ] && reactivity=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"ttfx_text":"[^"]*"' "$STATE" || true); [ -n "$v" ] && ttfx_text=$(echo "$v" | sed 's/.*"ttfx_text":"\([^"]*\)".*/\1/')
-  v=$(grep -o '"byline"[^,}]*' "$STATE" || true);    [ -n "$v" ] && byline=$(echo "$v" | sed 's/.*:"\([^"]*\)".*/\1/')
-  v=$(grep -o '"effects"[^]]*\]' "$STATE" || true);  [ -n "$v" ] && effects=$(echo "$v" | sed 's/^"effects"\s*:\s*\[//; s/\]$//' | grep -o '"[a-z]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')
+  v=$(grep -o '"panel_opacity":[^,}]*' "$STATE" || true); [ -n "$v" ] && panel_opacity=$(echo "$v" | grep -o '[0-9.]\+' | head -1)
+  v=$(grep -o '"byline"[^,}]*' "$STATE" || true);    [ -n "$v" ] && byline=$(echo "$v" | sed 's/.*"byline":"\([^"]*\)".*/\1/')
+  # effects: read the array using grep for the whole bracket block, then
+  # extract quoted names. Works for both compact and pretty-printed JSON.
+  v=$(grep -o '"effects"[^]]*\]' "$STATE" || true)
+  if [ -n "$v" ]; then
+    effects=$(echo "$v" | sed 's/.*\[//; s/\].*//' | tr ',' '\n' | grep -o '"[a-z]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')
+  fi
+  v=$(grep -o '"use_theme_colors"[^,}]*' "$STATE" || true); [ -n "$v" ] && use_theme_colors=$(echo "$v" | grep -o 'true\|false')
 fi
 
 arg="$1"
@@ -48,12 +55,14 @@ case "$arg" in
   audio=*)    audio=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   show_fps=*) show_fps=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   boot_between=*) boot_between=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
+  use_theme_colors=*) use_theme_colors=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   intensity=*) intensity="${arg#*=}" ;;
   intro_size=*) intro_size="${arg#*=}" ;;
   rotate_secs=*) rotate_secs="${arg#*=}" ;;
   resolution=*) resolution="${arg#*=}" ;;
   reactivity=*) reactivity="${arg#*=}" ;;
   ttfx_text=*) ttfx_text="${arg#*=}" ;;
+  panel_opacity=*) panel_opacity="${arg#*=}" ;;
   effect=*)   effect="${arg#*=}" ;;
   byline=*)   byline="${arg#*=}" ;;
   restart)    restart=$((restart + 1)) ;;
@@ -69,7 +78,7 @@ esac
 [ -z "$effects" ] && effects="$effect"
 
 # emit JSON array for effects
-arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd, -)
+arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/\"&"/' | paste -sd, -)
 
-printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s,"resolution":%s,"reactivity":%s,"ttfx_text":"%s"}\n' \
-  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" > "$STATE"
+printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s,"resolution":%s,"reactivity":%s,"ttfx_text":"%s","panel_opacity":%s,"use_theme_colors":%s}\n' \
+  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" "$panel_opacity" "${use_theme_colors:-false}" > "$STATE"

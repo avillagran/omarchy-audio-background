@@ -29,6 +29,31 @@ use std::thread;
 use std::time::Duration;
 use vte4::{TerminalExt, TerminalExtManual};
 
+// Thread-local palette shared between the watcher (run_render) and the effects
+// (fx_matrix, etc.). The watcher writes the current palette here whenever the
+// theme changes; effects read it every frame so color changes apply live
+// without restarting the plugin.
+thread_local! {
+    static THEME_PALETTE: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+fn set_theme_palette(palette: Vec<String>) {
+    THEME_PALETTE.with(|p| *p.borrow_mut() = palette);
+}
+
+fn get_theme_palette() -> Vec<String> {
+    THEME_PALETTE.with(|p| p.borrow().clone())
+}
+
+// Convert a tint index (0=default, 1..=palette.len()) to an ANSI color string.
+fn tint_to_color(tint: u8, palette: &[String]) -> String {
+    if tint == 0 || palette.is_empty() {
+        String::new()
+    } else {
+        let idx = ((tint - 1) as usize).min(palette.len() - 1);
+        palette[idx].clone()
+    }
+}
 const DEFAULT_EFFECTS: [&str; 8] = ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"];
 const DEFAULT_BYLINE: &str = "By x.com/avillagran";
 
@@ -54,6 +79,12 @@ struct Config {
     // How strongly ttfx effects react to audio: slider 0..5 (0 = off, 2 = normal, 5 =
     // strong). Scales the frame-pacing speed boost driven by the live volume/beat.
     reactivity: i64,
+    // When true, the boot intro types one letter per audio beat (with a timeout
+    // fallback if no music is playing), so the letters appear synced to the rhythm.
+    intro_beat_sync: bool,
+    // When true, use the active Omarchy theme colors for the effect palettes instead
+    // of the built-in hardcoded colors. Requires omarchy-theme-current to be installed.
+    use_theme_colors: bool,
 }
 
 impl Default for Config {
@@ -73,6 +104,8 @@ impl Default for Config {
             ttfx_text: "OMARCHY".into(),
             resolution: 1,
             reactivity: 2,
+            intro_beat_sync: true,
+            use_theme_colors: false,
         }
     }
 }
@@ -104,7 +137,10 @@ fn read_config() -> Config {
         .or_else(|_| std::fs::read_to_string(legacy_config_path()));
     let text = match text {
         Ok(t) => t,
-        Err(_) => return cfg,
+        Err(e) => {
+            log_dbg(&format!("read_config: no state file ({e}) -> defaults effect={} effects={:?}", cfg.effect, cfg.effects));
+            return cfg;
+        }
     };
     if let Some(v) = json_bool(&text, "running") { cfg.running = v; }
     if let Some(v) = json_bool(&text, "audio") { cfg.audio = v; }
@@ -119,6 +155,8 @@ fn read_config() -> Config {
     if let Some(v) = json_str(&text, "ttfx_text") { if !v.trim().is_empty() { cfg.ttfx_text = v; } }
     if let Some(v) = json_num(&text, "resolution") { cfg.resolution = v; }
     if let Some(v) = json_num(&text, "reactivity") { cfg.reactivity = v; }
+    if let Some(v) = json_bool(&text, "intro_beat_sync") { cfg.intro_beat_sync = v; }
+    if let Some(v) = json_bool(&text, "use_theme_colors") { cfg.use_theme_colors = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -170,6 +208,113 @@ fn json_str_list(text: &str, key: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+// Parse a simple TOML colors.toml file from Omarchy themes.
+// Only handles `key = "value"` lines (no sections, no tables). Returns a map
+// of color name -> hex string (without the leading #).
+fn parse_theme_colors(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') { continue; }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim().to_string();
+            let val = line[eq+1..].trim();
+            let val = val.strip_prefix('"').unwrap_or(val);
+            let val = val.strip_suffix('"').unwrap_or(val);
+            if !key.is_empty() && !val.is_empty() { out.push((key, val.to_string())); }
+        }
+    }
+    out
+}
+
+// Convert a hex color string (with or without leading #) to an ANSI 24-bit SGR code.
+// Supports both 6-digit (#RRGGBB) and 3-digit (#RGB) forms.
+fn hex_to_ansi(hex: &str) -> String {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let bytes = if hex.len() == 6 {
+        [u8::from_str_radix(&hex[..2], 16).unwrap_or(0),
+         u8::from_str_radix(&hex[2..4], 16).unwrap_or(0),
+         u8::from_str_radix(&hex[4..6], 16).unwrap_or(0)]
+    } else if hex.len() == 3 {
+        let r = u8::from_str_radix(&hex[..1], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&hex[1..2], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&hex[2..3], 16).unwrap_or(0);
+        [r * 17, g * 17, b * 17]
+    } else { [0, 0, 0] };
+    format!("\x1b[38;2;{};{};{}m", bytes[0], bytes[1], bytes[2])
+}
+
+// Read the active Omarchy theme's colors.toml and return a map of color name -> ANSI code.
+// Returns empty map if the theme file can't be read (graceful degradation to hardcoded colors).
+fn read_theme_colors() -> Vec<(String, String)> {
+    let theme_name_path = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    ).join(".local/state/omarchy/current/theme.name");
+    let theme_name = match std::fs::read_to_string(&theme_name_path) {
+        Ok(t) => t.trim().to_string(),
+        Err(_) => return Vec::new(),
+    };
+    if theme_name.is_empty() { return Vec::new(); }
+    let omarchy_path = std::env::var("OMARCHY_PATH").unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".local/share/omarchy").to_string_lossy().to_string()
+    });
+    let colors_path = format!("{}/themes/{}/colors.toml", omarchy_path, theme_name);
+    match std::fs::read_to_string(&colors_path) {
+        Ok(c) => parse_theme_colors(&c),
+        Err(_) => Vec::new(),
+    }
+}
+
+// Build an effect palette from the active theme colors.
+fn theme_palette(theme: &[(String, String)], effect: &str) -> Vec<String> {
+    let get = |name: &str, fallback: &str| -> String {
+        for (k, v) in theme { if k == name { return hex_to_ansi(v); } }
+        fallback.to_string()
+    };
+    let accent = get("accent", "\x1b[96m");
+    let foreground = get("foreground", "\x1b[37m");
+    let background = get("background", "\x1b[40m");
+    let red = get("red", "\x1b[31m");
+    let green = get("green", "\x1b[32m");
+    let blue = get("blue", "\x1b[34m");
+    let cyan = get("cyan", "\x1b[36m");
+    let yellow = get("yellow", "\x1b[33m");
+    let magenta = get("magenta", "\x1b[35m");
+    let bright_red = get("bright_red", "\x1b[91m");
+    let bright_green = get("bright_green", "\x1b[92m");
+    let bright_cyan = get("bright_cyan", "\x1b[96m");
+    let bright_blue = get("bright_blue", "\x1b[94m");
+    let bright_yellow = get("bright_yellow", "\x1b[93m");
+    let bright_magenta = get("bright_magenta", "\x1b[95m");
+
+    match effect {
+        "rain" => vec![accent.clone(), cyan.clone(), foreground.clone()],
+        "matrix" => vec![accent.clone(), green.clone(), blue.clone()],
+        "wave" => vec![accent.clone(), magenta.clone(), foreground.clone()],
+        "bars" => vec![yellow.clone(), bright_yellow.clone(), foreground.clone()],
+        "fire" => vec![red.clone(), bright_red.clone(), yellow.clone()],
+        "life" => vec![green.clone(), bright_green.clone(), foreground.clone()],
+        "starfield" => vec![foreground.clone(), bright_cyan.clone(), background.clone()],
+        "donut" => vec![accent.clone(), cyan.clone(), yellow.clone()],
+        _ => vec![foreground.clone(), green.clone(), blue.clone()],
+    }
+}
+
+// Hardcoded fallback palettes (used when use_theme_colors is false OR theme unavailable).
+fn hardcoded_palette(effect: &str) -> Vec<String> {
+    match effect {
+        "rain" => vec!["\x1b[96m".to_string(), "\x1b[36m".to_string(), "\x1b[37m".to_string()],
+        "wave" => vec!["\x1b[95m".to_string(), "\x1b[35m".to_string(), "\x1b[37m".to_string()],
+        "bars" => vec!["\x1b[93m".to_string(), "\x1b[33m".to_string(), "\x1b[37m".to_string()],
+        "fire" => vec!["\x1b[91m".to_string(), "\x1b[93m".to_string(), "\x1b[31m".to_string()],
+        "life" => vec!["\x1b[92m".to_string(), "\x1b[32m".to_string(), "\x1b[90m".to_string()],
+        "starfield" => vec!["\x1b[97m".to_string(), "\x1b[37m".to_string(), "\x1b[90m".to_string()],
+        "donut" => vec!["\x1b[96m".to_string(), "\x1b[95m".to_string(), "\x1b[93m".to_string()],
+        _ => vec!["\x1b[97m".to_string(), "\x1b[92m".to_string(), "\x1b[32m".to_string()],
+    }
+}
+
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -194,7 +339,9 @@ fn main() -> Result<()> {
         let cell_aspect = arg_value(&args, "--cell-aspect").and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
         let show_intro = !args.iter().any(|a| a == "--no-intro");
-        return run_render(&effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text, reactivity);
+        let cfg = read_config();
+        let intro_beat_sync = arg_value(&args, "--intro-beat-sync").map(|s| s == "1").unwrap_or(cfg.intro_beat_sync);
+        return run_render(&cfg, &effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text, reactivity, intro_beat_sync);
     }
 
     // Drive a vendored ttfx effect directly (library bridge proof).
@@ -266,6 +413,7 @@ fn main() -> Result<()> {
             let changed = *lc.borrow() != cfg;
             if changed {
                 let old = lc.borrow().clone();
+                log_dbg(&format!("poll changed: old effect={} effects={:?} -> new effect={} effects={:?} ae={} running={}", old.effect, old.effects, cfg.effect, cfg.effects, ae.borrow(), cfg.running));
                 // If the active-effect selection changed, honor it; otherwise
                 // keep rotating from where we are. Only honor if still enabled.
                 if cfg.effect != old.effect && is_valid_effect(&cfg.effect) && cfg.effects.contains(&cfg.effect) {
@@ -286,9 +434,11 @@ fn main() -> Result<()> {
                     || cfg.intensity != old.intensity
                     || cfg.audio != old.audio
                     || cfg.byline != old.byline
+                    || cfg.ttfx_text != old.ttfx_text
                     || cfg.restart != old.restart
                     || cfg.intro_size != old.intro_size
-                    || cfg.show_fps != old.show_fps;
+                    || cfg.show_fps != old.show_fps
+                    || cfg.resolution != old.resolution;
                 // Rebuild only when a structural/visual field actually changed. Changing
                 // a slider (intensity, reactivity — the latter is applied live by the
                 // renderer) or a rotation toggle should NOT replay the boot intro (that's
@@ -297,6 +447,7 @@ fn main() -> Result<()> {
                 let intro = cfg.effect != old.effect
                     || cfg.restart != old.restart
                     || cfg.intro_size != old.intro_size
+                    || cfg.ttfx_text != old.ttfx_text
                     || cfg.byline != old.byline;
                 if visual {
                     rebuild_layers(&w, &b, &cfg, &ae.borrow(), intro);
@@ -373,6 +524,14 @@ fn monitor_signature() -> String {
     parts.join("|")
 }
 
+fn log_dbg(msg: &str) {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() % 86400).unwrap_or(0);
+    let h = ts / 3600; let m = (ts % 3600) / 60; let s = ts % 60;
+    let line = format!("[{h:02}:{m:02}:{s:02}] {msg}\n");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/ttfx-bg-debug.log").and_then(|mut f| f.write_all(line.as_bytes()));
+    eprintln!("{msg}");
+}
+
 fn rebuild_layers(
     windows: &Rc<RefCell<Vec<gtk4::ApplicationWindow>>>,
     self_bin: &str,
@@ -380,6 +539,7 @@ fn rebuild_layers(
     effect: &str,
     show_intro: bool,
 ) {
+    log_dbg(&format!("rebuild_layers: effect={effect} show_intro={show_intro} running={} audio={} intensity={} reactivity={} resolution={} rotate_secs={} effect_field={} effects={:?} ttfx_text={}", cfg.running, cfg.audio, cfg.intensity, cfg.reactivity, cfg.resolution, cfg.rotate_secs, cfg.effect, cfg.effects, cfg.ttfx_text));
     // Kill renderer subprocesses from a previous build. The pattern `--render`
     // only matches the child renderers, never this parent binary.
     let _ = std::process::Command::new("pkill")
@@ -474,10 +634,16 @@ fn spawn_layer_for_monitor(
         // Rotation with "boot between backgrounds" off skips the splash.
         if !show_intro { argv.push("--no-intro".into()); }
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        // Pass intro_beat_sync as CLI arg so the renderer uses it
+        let intro_beat_sync_arg = if cfg.intro_beat_sync { "1" } else { "0" };
+        argv.push("--intro-beat-sync".into());
+        argv.push(intro_beat_sync_arg.into());
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         // Pre-clear so Vte doesn't flash its "N by M cells" placeholder while
         // the renderer's PTY is still connecting.
         term.feed(b"\x1b[2J\x1b[H\x1b[40m");
         let effect_for_log = effect.to_string();
+        log_dbg(&format!("spawn_async: effect={effect_for_log} {cols}x{rows} intensity={} reactivity={} audio={} ttfx_text={} show_intro={}", cfg.intensity, cfg.reactivity, cfg.audio, cfg.ttfx_text, show_intro));
         term.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None,
@@ -488,8 +654,8 @@ fn spawn_layer_for_monitor(
             2000,
             None::<&gtk4::gio::Cancellable>,
             move |res| match res {
-                Ok(_) => println!("renderer spawned ({cols}x{rows}, effect={effect_for_log})"),
-                Err(e) => eprintln!("spawn error: {e:?}"),
+                Ok(_) => { println!("renderer spawned ({cols}x{rows}, effect={effect_for_log})"); log_dbg(&format!("spawn ok: {effect_for_log} {cols}x{rows}")); },
+                Err(e) => { eprintln!("spawn error: {e:?}"); log_dbg(&format!("spawn error {effect_for_log}: {e:?}")); },
             },
         );
     }
@@ -634,7 +800,8 @@ struct Screen {
     rows: usize,
     out: String,
     grid: Vec<Vec<char>>,
-    tint: Vec<Vec<u8>>, // 0 = default, 1.. = palette index
+    color: Vec<Vec<String>>, // per-cell ANSI color string (empty = default)
+    dirty: Vec<Vec<bool>>,   // cells painted this frame (need clearing next frame)
     show_fps: bool,
     fps_frames: u32,
     fps_since: std::time::Instant,
@@ -649,7 +816,8 @@ impl Screen {
             cols, rows,
             out: String::with_capacity(cols * rows * 8),
             grid: vec![vec![' '; cols]; rows],
-            tint: vec![vec![0u8; cols]; rows],
+            color: vec![vec![String::new(); cols]; rows],
+            dirty: vec![vec![false; cols]; rows],
             show_fps,
             fps_frames: 0,
             fps_since: std::time::Instant::now(),
@@ -669,36 +837,68 @@ impl Screen {
         }
         let text = format!("FPS {:.0}", self.fps_value);
         for (i, ch) in text.chars().enumerate() {
-            if i < self.cols { self.put(i, 0, ch, 1); }
+            if i < self.cols { self.put(i, 0, ch, "\x1b[37m".to_string()); }
         }
     }
     fn clear(&mut self) {
         for r in self.grid.iter_mut() { r.fill(' '); }
-        for r in self.tint.iter_mut() { r.fill(0); }
+        for r in self.color.iter_mut() { r.iter_mut().for_each(|c| c.clear()); }
+        for r in self.dirty.iter_mut() { r.fill(false); }
     }
-    fn put(&mut self, x: usize, y: usize, ch: char, tint: u8) {
-        if x < self.cols && y < self.rows {
-            self.grid[y][x] = ch;
-            self.tint[y][x] = tint;
-        }
-    }
-    fn present(&mut self, palette: &[&str]) {
-        self.out.clear();
-        self.out.push_str("\x1b[H");
-        let mut cur: u8 = 255;
+    // Clear only cells that were painted the previous frame (dirty tracking).
+    // Cells NOT painted keep their color — this enables crossfade between themes.
+    fn clear_dirty(&mut self) {
         for r in 0..self.rows {
             for c in 0..self.cols {
-                let t = self.tint[r][c];
-                if t != cur {
-                    if t == 0 { self.out.push_str("\x1b[0m"); }
-                    else if (t as usize) <= palette.len() { self.out.push_str(palette[(t - 1) as usize]); }
-                    cur = t;
+                if self.dirty[r][c] {
+                    self.grid[r][c] = ' ';
+                    self.color[r][c].clear();
+                    self.dirty[r][c] = false;
+                }
+            }
+        }
+    }
+    fn put(&mut self, x: usize, y: usize, ch: char, color: String) {
+        if x < self.cols && y < self.rows {
+            self.grid[y][x] = ch;
+            self.color[y][x] = color;
+            self.dirty[y][x] = true;
+        }
+    }
+    // Erase a single cell (restore to blank, no color) without dirty tracking.
+    fn erase(&mut self, x: usize, y: usize) {
+        if x < self.cols && y < self.rows {
+            self.grid[y][x] = ' ';
+            self.color[y][x].clear();
+            self.dirty[y][x] = false;
+        }
+    }
+    // Return the ANSI color currently stored at a cell (empty = default).
+    fn get_color(&self, x: usize, y: usize) -> String {
+        if x < self.cols && y < self.rows {
+            self.color[y][x].clone()
+        } else {
+            String::new()
+        }
+    }
+    fn present(&mut self) {
+        self.out.clear();
+        self.out.push_str("\x1b[H");
+        let mut cur: &str = "";
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let col = &self.color[r][c];
+                if col.is_empty() {
+                    if cur != "" { self.out.push_str("\x1b[0m"); cur = ""; }
+                } else if col != cur {
+                    self.out.push_str(col);
+                    cur = col;
                 }
                 self.out.push(self.grid[r][c]);
             }
             if r + 1 < self.rows { self.out.push('\n'); }
         }
-        if cur != 0 { self.out.push_str("\x1b[0m"); }
+        if cur != "" { self.out.push_str("\x1b[0m"); }
         print!("{}", self.out);
         std::io::stdout().flush().ok();
     }
@@ -711,7 +911,8 @@ impl Screen {
                 self.cols = c;
                 self.rows = r;
                 self.grid = vec![vec![' '; c]; r];
-                self.tint = vec![vec![0u8; c]; r];
+                self.color = vec![vec![String::new(); c]; r];
+                self.dirty = vec![vec![false; c]; r];
                 self.out = String::with_capacity(c * r * 8);
                 print!("\x1b[2J\x1b[H");
                 return true;
@@ -844,7 +1045,8 @@ fn art_width(text: &str, scale: usize, gap: usize) -> usize {
 // Intro: the title, byline and effect tag ALL render as ASCII art (scaled
 // ×1..×3), centered on BOTH axes as a single stack. The title types in letter by
 // letter, then the byline, then the effect tag, then it holds.
-fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, intro_size: i64) {
+// Audio-reactive: each letter step pulses to the beat (volume/beat => faster typing).
+fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, intro_size: i64, audio: &AudioState, intro_beat_sync: bool) {
     let scale = intro_size.clamp(1, 3) as usize;
     let gap = scale.max(1); // spaces between ASCII-art letters
     let title = "OMARCHY AUDIO BACKGROUND".to_string();
@@ -872,7 +1074,7 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     let draw = |scr: &mut Screen, text: &str, upto: usize, x: usize, y: usize, color: u8| {
         for (r, line) in art_prefix(text, upto, scale, gap).iter().enumerate() {
             for (i, ch) in line.chars().enumerate() {
-                if ch != ' ' { scr.put(x + i, y + r, ch, color); }
+                if ch != ' ' { scr.put(x + i, y + r, ch, tint_to_color(color, palette)); }
             }
         }
     };
@@ -881,31 +1083,82 @@ fn show_intro(scr: &mut Screen, palette: &[&str], byline: &str, effect: &str, in
     let by_len = by.chars().count();
     let tag_len = tag.chars().count();
 
-    // Phase 1: type the title, one ASCII-art letter at a time.
-    for step in 0..=title_len {
-        scr.clear();
-        draw(scr, &title, step, tx_title, ty, 1);
-        scr.fps_overlay();
-        scr.present(palette);
-        thread::sleep(Duration::from_millis(70));
+    // Helper: wait for the next audio beat (with timeout fallback if no music).
+    let wait_for_beat = |audio: &AudioState, timeout_ms: u64| -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if audio.beat() { return true; }
+            if start.elapsed() >= Duration::from_millis(timeout_ms) { return false; }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    if intro_beat_sync && audio.volume() > 0.02 {
+        // Efectos internos de ttfx que NO usan colores de tema; usar palett...[truncated]
+        for step in 0..=title_len {
+            scr.clear_dirty();
+            draw(scr, &title, step, tx_title, ty, 1);
+            scr.fps_overlay();
+            scr.present();
+            let beat_sync = wait_for_beat(audio, 1500);
+            // If we got a beat, great; otherwise fall back to volume-paced delay.
+            if !beat_sync {
+                let vol = audio.volume().clamp(0.0, 1.0);
+                let speed = 1.0 + vol * 2.5;
+                thread::sleep(Duration::from_millis((70.0 / speed).max(12.0) as u64));
+            }
+        }
+        // Phase 2: type the byline under the complete title.
+        for step in 0..=by_len {
+            scr.clear_dirty();
+            draw(scr, &title, title_len, tx_title, ty, 1);
+            draw(scr, &by, step, tx_by, by_y, 2);
+            scr.fps_overlay();
+            scr.present();
+            let beat_sync = wait_for_beat(audio, 1500);
+            if !beat_sync {
+                let vol = audio.volume().clamp(0.0, 1.0);
+                let speed = 1.0 + vol * 2.5;
+                thread::sleep(Duration::from_millis((45.0 / speed).max(10.0) as u64));
+            }
+        }
+    } else {
+        // Phase 1: type the title, one ASCII-art letter at a time.
+        for step in 0..=title_len {
+            scr.clear_dirty();
+            draw(scr, &title, step, tx_title, ty, 1);
+            scr.fps_overlay();
+            scr.present();
+            let vol = audio.volume().clamp(0.0, 1.0);
+            let speed = 1.0 + vol * 2.5 + if audio.beat() { 1.0 } else { 0.0 };
+            thread::sleep(Duration::from_millis((70.0 / speed).max(12.0) as u64));
+        }
+        // Phase 2: type the byline under the complete title.
+        for step in 0..=by_len {
+            scr.clear_dirty();
+            draw(scr, &title, title_len, tx_title, ty, 1);
+            draw(scr, &by, step, tx_by, by_y, 2);
+            scr.fps_overlay();
+            scr.present();
+            let vol = audio.volume().clamp(0.0, 1.0);
+            let speed = 1.0 + vol * 2.5 + if audio.beat() { 1.0 } else { 0.0 };
+            thread::sleep(Duration::from_millis((45.0 / speed).max(10.0) as u64));
+        }
     }
-    // Phase 2: type the byline under the complete title.
-    for step in 0..=by_len {
-        scr.clear();
-        draw(scr, &title, title_len, tx_title, ty, 1);
-        draw(scr, &by, step, tx_by, by_y, 2);
-        scr.fps_overlay();
-        scr.present(palette);
-        thread::sleep(Duration::from_millis(45));
-    }
+
     // Phase 3: stamp the effect tag, then hold the finished splash.
-    scr.clear();
+    scr.clear_dirty();
     draw(scr, &title, title_len, tx_title, ty, 1);
     draw(scr, &by, by_len, tx_by, by_y, 2);
     draw(scr, &tag, tag_len, tx_tag, tag_y, 3);
     scr.fps_overlay();
-    scr.present(palette);
-    thread::sleep(Duration::from_millis(2600));
+    scr.present();
+    // Hold pulses with audio: beat shortens hold, quiet holds full 2600ms.
+    let hold_base = 2600.0;
+    // If audio active, let the hold be slightly shorter on loud sections so boot feels synced.
+    let vol = audio.volume().clamp(0.0, 1.0);
+    let hold_speed = 1.0 + vol * 0.8 + if audio.beat() { 0.5 } else { 0.0 };
+    thread::sleep(Duration::from_millis((hold_base / hold_speed).max(900.0) as u64));
 }
 
 // ttfx effects we route to the vendored engine (everything in the catalog EXCEPT
@@ -959,6 +1212,7 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
 // the music like the hand-rolled effects do. Loops so it runs as a continuous
 // background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
 fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, reactivity: i64) -> Result<()> {
+    log_dbg(&format!("run_ttfx enter: effect={effect_name} {cols}x{rows} ttfx_text={ttfx_text} reactivity={reactivity} audio_enabled={audio_enabled}"));
     use clap::Parser;
     use std::io::Write;
     use ttfx::engine::ctx::{Clock, EngineCtx};
@@ -977,7 +1231,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
         // --random-effect), then drive it ourselves so we can pace it by audio.
         let mut effect = match ttfx::cli::Cli::try_parse_from(["ttfx", effect_name]) {
             Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
-            _ => { eprintln!("unknown ttfx effect: {effect_name}"); return Ok(()); }
+            _ => { let m = format!("unknown ttfx effect: {effect_name}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
         };
         // Canvas = the configured text as centered ASCII art (rebuilt each pass).
         let input = ttfx_canvas_input(ttfx_text, cols, rows);
@@ -987,9 +1241,9 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
         config.frame_rate = fps;
         let mut ctx = match EngineCtx::new(&input, config, Rng::from_entropy(), Clock::virtual_with_frame_rate(fps)) {
             Ok(c) => c,
-            Err(e) => { eprintln!("ttfx ctx error: {e:?}"); return Ok(()); }
+            Err(e) => { let m = format!("ttfx ctx error for {effect_name}: {e:?}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
         };
-        if let Err(e) = effect.build(&mut ctx) { eprintln!("ttfx build error: {e:?}"); return Ok(()); }
+        if let Err(e) = effect.build(&mut ctx) { let m = format!("ttfx build error for {effect_name}: {e:?}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
 
         // Audio-paced frame loop: with a virtual clock each next_frame() advances the
         // animation by one tick, so pacing the calls by the live audio level makes the
@@ -1024,6 +1278,14 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
                     ttfx::utils::ansi::set_audio_color(false, 1.0, [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]);
                 }
             }
+            // Audio-reactive per-effect hook (e.g. thunderstorm lightning on loud beats).
+            // Runs before next_frame so the effect can inject a strike this tick.
+            if audio_enabled && reactivity > 0 {
+                let vol = audio.volume().clamp(0.0, 1.0);
+                let bass = (audio.band_at(0, NBANDS) + audio.band_at(1, NBANDS) * 0.5).clamp(0.0, 1.0);
+                let beat = audio.beat();
+                effect.on_audio(&mut ctx, vol, bass, beat);
+            }
             // Stop if the PTY went away (effect settled / terminal gone).
             let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
             if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
@@ -1044,35 +1306,51 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             let speed = if audio_enabled && reactivity > 0 { (1.0 + boost).clamp(1.0, 3.0) } else { 1.0 };
             thread::sleep(Duration::from_secs_f64(frame_secs / speed as f64));
         }
-        let _ = ctx.terminal.restore_cursor(&mut out, "\n");
-        // Settled: brief pause, then replay as a continuous background.
-        thread::sleep(Duration::from_millis(400));
-        // Re-check PTY size between passes (resize).
+        let _ = ctx.terminal.restore_cursor(&mut out, "");
+        // Continuous background: loop all ttfx effects for the full rotate_secs
+        // without a gap. The 400ms pause caused the visible "para y vuelve".
+        // Check if Service already switched effect/off while we were running.
+        {
+            let live = read_config();
+            if live.effect != effect_name || !live.running {
+                let _ = ctx.terminal.restore_cursor(&mut out, "\n");
+                return Ok(());
+            }
+        }
+        // Tiny settle without blanking — next pass rebuilds immediately.
         let (c2, r2) = settle_pty_size(cols, rows);
         if (c2, r2) != (cols, rows) { cols = c2; rows = r2; }
     }
 }
 
-fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str, reactivity: i64) -> Result<()> {
+fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str, reactivity: i64, intro_beat_sync: bool) -> Result<()> {
+    log_dbg(&format!("run_render enter: effect={effect} {cols}x{rows} intensity={intensity} audio={audio} ttfx_text={ttfx_text} reactivity={reactivity} with_intro={with_intro} byline={byline} intro_beat_sync={intro_beat_sync}"));
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
     // Use the REAL PTY size, but WAIT for it to settle first (Vte spawns at 80x24).
     let (cols, rows) = settle_pty_size(cols, rows);
     let mut scr = Screen::new(cols, rows, show_fps);
 
-    let palette: &[&str] = match effect {
-        "rain" => &["\x1b[96m", "\x1b[36m", "\x1b[37m"],
-        "wave" => &["\x1b[95m", "\x1b[35m", "\x1b[37m"],
-        "bars" => &["\x1b[93m", "\x1b[33m", "\x1b[37m"],
-        "fire" => &["\x1b[91m", "\x1b[93m", "\x1b[31m"],
-        "life" => &["\x1b[92m", "\x1b[32m", "\x1b[90m"],
-        "starfield" => &["\x1b[97m", "\x1b[37m", "\x1b[90m"],
-        "donut" => &["\x1b[96m", "\x1b[95m", "\x1b[93m"],
-        _ => &["\x1b[97m", "\x1b[92m", "\x1b[32m"], // matrix
+    let palette: Vec<String> = if cfg.use_theme_colors {
+        // Use theme colors when user opts in; fall back gracefully if theme unavailable
+        let tc = read_theme_colors();
+        if !tc.is_empty() {
+            theme_palette(&tc, effect).into_iter().collect()
+        } else {
+            hardcoded_palette(effect)
+        }
+    } else {
+        hardcoded_palette(effect)
     };
+    let palette_refs: Vec<&str> = palette.iter().map(|s| s.as_str()).collect();
+
+    // Initialize the thread-local palette so effects can read live theme colors
+    if cfg.use_theme_colors {
+        set_theme_palette(palette.clone());
+    }
 
     if with_intro {
-        show_intro(&mut scr, palette, byline, effect, intro_size);
+        show_intro(&mut scr, &palette, byline, effect, intro_size, &state, intro_beat_sync);
     }
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
@@ -1084,14 +1362,15 @@ fn run_render(effect: &str, cols: usize, rows: usize, intensity: i64, audio: boo
     // Each effect returns Ok(()) when it detects a PTY resize; re-dispatch so
     // it restarts with fresh state at the new size (no jump, no stale grid).
     loop {
+        let pal: &[String] = &palette;
         let res = match effect {
-            "donut" => fx_donut(&mut scr, palette, intensity, &state, cell_aspect),
-            "fire" => fx_fire(&mut scr, palette, intensity, &state),
-            "starfield" => fx_starfield(&mut scr, palette, intensity, &state),
-            "life" => fx_life(&mut scr, palette, intensity, &state),
-            "wave" => fx_wave(&mut scr, palette, intensity, &state),
-            "bars" => fx_bars(&mut scr, palette, intensity, &state),
-            _ => fx_matrix(&mut scr, palette, intensity, &state, effect == "rain"),
+            "donut" => fx_donut(&mut scr, pal, intensity, &state, cell_aspect),
+            "fire" => fx_fire(&mut scr, pal, intensity, &state),
+            "starfield" => fx_starfield(&mut scr, pal, intensity, &state),
+            "life" => fx_life(&mut scr, pal, intensity, &state),
+            "wave" => fx_wave(&mut scr, pal, intensity, &state),
+            "bars" => fx_bars(&mut scr, pal, intensity, &state),
+            _ => fx_matrix(&mut scr, pal, intensity, &state, effect == "rain", cfg.use_theme_colors, effect),
         };
         if let Err(e) = res {
             eprintln!("render error: {e:?}");
@@ -1112,7 +1391,7 @@ fn frame_delay(base_ms: i64, intensity: i64, audio: &AudioState) -> Duration {
 // --- matrix / rain: column rain where EACH COLUMN follows its frequency band
 // (rain equalizer, like the node implementation): band energy raises that
 // column's fall speed and brightness. Global spawn density follows volume. ---
-fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState, rain: bool) -> Result<()> {
+fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, rain: bool, use_theme_colors: bool, effect: &str) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let chars: Vec<char> = if rain {
@@ -1124,48 +1403,99 @@ fn fx_matrix(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSt
     let trail_base: usize = 8 + (intensity as usize) * 2;
     let (cols, rows) = (scr.cols, scr.rows);
     let mut head: Vec<i32> = (0..cols).map(|_| rng.gen_range(0..rows as i32)).collect();
+    let mut prev_head: Vec<i32> = head.clone();
     let mut speed: Vec<i32> = (0..cols).map(|_| rng.gen_range(speed_base..speed_base + 2).max(1)).collect();
     let mut trail: Vec<usize> = (0..cols).map(|_| rng.gen_range(trail_base..trail_base + 12)).collect();
+    // When the theme changes, the HEAD of every drop (the fresh character
+    // entering at the top) immediately uses the CURRENT palette, while each
+    // trail cell keeps the color it already had (stored per-cell). Old rain
+    // lingers in its old hue and new rain arrives in the new hue — a visible
+    // two-color mix toggling in real time, no respawn wait, no flash.
+    let mut cur_pal: Vec<String> = palette.to_vec();
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        // Detect theme changes live and switch the head palette immediately.
+        if use_theme_colors {
+            let new_colors = read_theme_colors();
+            if !new_colors.is_empty() {
+                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                if new_key != old_key {
+                    cached_theme_colors = new_colors.clone();
+                    cur_pal = theme_palette(&cached_theme_colors, effect);
+                    set_theme_palette(cur_pal.clone());
+                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
+                }
+            }
+        }
         let vol = audio.volume();
-        let spawn_chance = 0.35 + vol * 0.65; // caudal: more drops with sound
+        let spawn_chance = 0.35 + vol * 0.65;
+        // A) Erase cells this column's trail vacated since the previous frame.
         for c in 0..cols {
-            let band = audio.band_at(c, cols); // this column's frequency band
+            let h_prev = prev_head[c];
             let h = head[c];
+            let vac_top = h_prev - trail[c] as i32 + 1;
+            let vac_end = h - trail[c] as i32 + 1; // exclusive
+            if vac_end > vac_top {
+                for y in vac_top..vac_end.min(rows as i32) {
+                    if y >= 0 && y < rows as i32 {
+                        scr.erase(c, y as usize);
+                    }
+                }
+            }
+            // Column was reset/rested (head negative): clear its entire old trail
+            if h < 0 && vac_top >= 0 {
+                for y in vac_top..h_prev.min(rows as i32) {
+                    if y >= 0 && y < rows as i32 {
+                        scr.erase(c, y as usize);
+                    }
+                }
+            }
+        }
+        let band = |c: usize| audio.band_at(c, cols);
+        for c in 0..cols {
+            let h = head[c];
+            // Head (t=0) uses the CURRENT palette -> new color the instant the
+            // theme changes. Trail keeps the color already stored -> old hue
+            // persists until that drop scrolls away.
             for t in 0..trail[c] {
                 let y = h - t as i32;
                 if y >= 0 && y < rows as i32 {
-                    // brightness follows the band energy (rain equalizer)
-                    let tint = if t == 0 { 1 } else if band > 0.55 && t < 3 { 2 } else { 3 };
-                    scr.put(c, y as usize, chars[rng.gen_range(0..chars.len())], tint);
+                    let ch = chars[rng.gen_range(0..chars.len())];
+                    let color = if t == 0 {
+                        tint_to_color(1, &cur_pal)
+                    } else {
+                        scr.get_color(c, y as usize) // keep this cell's old color
+                    };
+                    scr.put(c, y as usize, ch, color);
                 }
             }
-            // fall speed grows with the column's band energy
-            head[c] += speed[c] + (band * 2.0) as i32;
+            // Advance drop; spawn sets a fresh trail head that uses cur_pal.
+            prev_head[c] = h;
+            head[c] = h + speed[c] + (band(c) * 2.0) as i32;
             if head[c] - trail[c] as i32 > rows as i32 {
                 if rng.gen::<f32>() < spawn_chance {
                     head[c] = -(rng.gen_range(0..30));
                     speed[c] = rng.gen_range(speed_base..speed_base + 2).max(1);
                     trail[c] = rng.gen_range(trail_base..trail_base + 12);
                 } else {
-                    head[c] = -(rows as i32 + 10); // rest before next drop
+                    head[c] = -(rows as i32 + 10);
                 }
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         thread::sleep(frame_delay(40, intensity, audio));
     }
 }
 
 // --- wave: layered sine waves scrolling horizontally ---
-fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
     let mut t = 0f32;
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        scr.clear_dirty();
         let lv = audio.volume();
         let (cols, rows) = (scr.cols, scr.rows);
         let cy = rows as f32 / 2.0;
@@ -1176,12 +1506,12 @@ fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
             for x in 0..cols {
                 let y = cy + amp * (x as f32 * freq + phase).sin();
                 if y >= 0.0 && (y as usize) < rows {
-                    scr.put(x, y as usize, if layer == 0 { '~' } else { '-' }, layer + 1);
+                    scr.put(x, y as usize, if layer == 0 { '~' } else { '-' }, tint_to_color(layer + 1, palette));
                 }
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         t += 0.12 + lv * 0.25;
         thread::sleep(frame_delay(45, intensity, audio));
     }
@@ -1189,12 +1519,12 @@ fn fx_wave(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
 
 // --- bars: equalizer driven by the REAL per-band spectrum (each bar = one
 // frequency band's energy), smoothed so it follows without flicker. ---
-fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
     let bands = NBANDS;
     let mut heights = vec![0f32; bands];
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        scr.clear_dirty();
         let (cols, rows) = (scr.cols, scr.rows);
         let maxh = rows as f32 * 0.9;
         let bw = cols / bands.max(1);
@@ -1206,12 +1536,12 @@ fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
             for y in 0..h.min(rows) {
                 let tint = if y as f32 > h as f32 * 0.7 { 1 } else if y as f32 > h as f32 * 0.4 { 2 } else { 3 };
                 for x in 0..bw.saturating_sub(1) {
-                    scr.put(b * bw + x, rows - 1 - y, '#', tint);
+                    scr.put(b * bw + x, rows - 1 - y, '#', tint_to_color(tint, palette));
                 }
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         thread::sleep(frame_delay(50, intensity, audio));
     }
 }
@@ -1220,7 +1550,7 @@ fn fx_bars(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
 // Scale follows the original donut.c proportions (30/80 horizontal, 15/22
 // vertical), which already bake in the terminal cell aspect. That keeps the
 // torus round on any screen; compressing by cell_aspect over-flattened it.
-fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState, cell_aspect: f32) -> Result<()> {
+fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, cell_aspect: f32) -> Result<()> {
     let _ = cell_aspect;
     let mut a = 0f32;
     let mut e = 1f32;
@@ -1232,7 +1562,7 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSta
     let mut zbuf = vec![0f32; cols * rows];
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        scr.clear_dirty();
         for b in zbuf.iter_mut() { *b = 0.0; }
         let lv = audio.volume();
         let mut j = 0f32;
@@ -1255,14 +1585,14 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSta
                     let ci2 = lum.max(0.0) as usize;
                     let ch = chars[ci2.min(chars.len() - 1)] as char;
                     let tint = if ci2 > 8 { 1 } else if ci2 > 4 { 2 } else { 3 };
-                    scr.put(x as usize, y as usize, ch, tint);
+                    scr.put(x as usize, y as usize, ch, tint_to_color(tint, palette));
                 }
                 i += 0.02;
             }
             j += 0.07;
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         let spin = 1.0 + lv * 2.0;
         a += 0.04 * spin;
         e += 0.02 * spin;
@@ -1271,7 +1601,7 @@ fn fx_donut(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioSta
 }
 
 // --- fire: classic doom fire from the bottom row. Height licks with audio. ---
-fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -1290,25 +1620,25 @@ fn fx_fire(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
                 heat[y][x] = heat[y + 1][src_x].saturating_sub(decay);
             }
         }
-        scr.clear();
+        scr.clear_dirty();
         for y in 0..rows {
             for x in 0..cols {
                 let h = heat[y][x] as usize;
                 if h > 0 {
                     let ci = (h * palette_chars.len() / 37).min(palette_chars.len() - 1);
                     let tint = if h > 24 { 1 } else if h > 12 { 2 } else { 3 };
-                    scr.put(x, y, palette_chars[ci], tint);
+                    scr.put(x, y, palette_chars[ci], tint_to_color(tint, palette));
                 }
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         thread::sleep(frame_delay(45, intensity, audio));
     }
 }
 
 // --- starfield: stars flying outward from the center. Speed follows audio. ---
-fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -1320,7 +1650,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &Audi
     )).collect();
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        scr.clear_dirty();
         let lv = audio.volume();
         let speed = (0.006 + intensity as f32 * 0.0012) * (1.0 + lv * 2.2);
         for s in stars.iter_mut() {
@@ -1331,17 +1661,17 @@ fn fx_starfield(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &Audi
             if px >= 0.0 && px < cols as f32 && py >= 0.0 && py < rows as f32 {
                 let depth = 1.0 - s.2;
                 let (ch, tint) = if depth > 0.75 { ('@', 1) } else if depth > 0.45 { ('*', 2) } else { ('.', 3) };
-                scr.put(px as usize, py as usize, ch, tint);
+                scr.put(px as usize, py as usize, ch, tint_to_color(tint, palette));
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         thread::sleep(frame_delay(40, intensity, audio));
     }
 }
 
 // --- life: Conway's Game of Life, reseeded on stagnation ---
-fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioState) -> Result<()> {
+fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState) -> Result<()> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let (cols, rows) = (scr.cols, scr.rows);
@@ -1353,20 +1683,20 @@ fn fx_life(scr: &mut Screen, palette: &[&str], intensity: i64, audio: &AudioStat
     let mut stagnant = 0u32;
     loop {
         if scr.maybe_resize() { return Ok(()); }
-        scr.clear();
+        scr.clear_dirty();
         for y in 0..rows {
             for x in 0..cols {
                 if grid[y][x] {
                     age[y][x] = age[y][x].saturating_add(1);
                     let tint = if age[y][x] > 30 { 1 } else if age[y][x] > 8 { 2 } else { 3 };
-                    scr.put(x, y, if age[y][x] > 8 { 'O' } else { 'o' }, tint);
+                    scr.put(x, y, if age[y][x] > 8 { 'O' } else { 'o' }, tint_to_color(tint, palette));
                 } else {
                     age[y][x] = 0;
                 }
             }
         }
         scr.fps_overlay();
-        scr.present(palette);
+        scr.present();
         let mut changed = 0u32;
         for y in 0..rows {
             for x in 0..cols {
