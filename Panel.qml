@@ -75,7 +75,9 @@ Panel {
   // When true, use the active Omarchy theme colors for the effect palettes instead
   // of the built-in hardcoded colors. Requires omarchy-theme-current to be installed.
   property bool useThemeColors: true
+  property bool transparentBackground: false
   function setUseThemeColors(v) { root.useThemeColors = v; write("use_theme_colors=" + (v ? "1" : "0")) }
+  function setTransparentBackground(v) { root.transparentBackground = v; write("transparent_background=" + (v ? "1" : "0")) }
   function toggleCollapsed() { root.collapsed = !root.collapsed; if (!root.collapsed) root.dragOffset = Qt.point(0,0) }
   // Cycle the active effect across the ENABLED set only (the user's selection).
   // Built-ins + ttfx combined catalog is for the grid UI, NOT for cycling.
@@ -149,6 +151,7 @@ Panel {
           if (typeof s.panel_opacity === "number") root.panelOpacity = Math.max(0.15, Math.min(1.0, s.panel_opacity))
           if (typeof s.intro_beat_sync === "boolean") root.introBeatSync = s.intro_beat_sync
           if (typeof s.use_theme_colors === "boolean") root.useThemeColors = s.use_theme_colors
+          if (typeof s.transparent_background === "boolean") root.transparentBackground = s.transparent_background
         } catch (e) {}
       }
     }
@@ -425,6 +428,12 @@ Panel {
         ToggleSwitch {
           checked: root.useThemeColors
           onToggled: root.setUseThemeColors(!root.useThemeColors)
+        }
+
+        PanelSectionHeader { text: "FONDO TRANSPARENTE  ·  " + (root.transparentBackground ? "ON" : "OFF") }
+        ToggleSwitch {
+          checked: root.transparentBackground
+          onToggled: root.setTransparentBackground(!root.transparentBackground)
         }
 
         PanelSectionHeader { text: "PANEL TRANSPARENCY  ·  " + Math.round(root.panelOpacity*100) + "%" }

@@ -85,6 +85,9 @@ struct Config {
     // When true, use the active Omarchy theme colors for the effect palettes instead
     // of the built-in hardcoded colors. Requires omarchy-theme-current to be installed.
     use_theme_colors: bool,
+    // When true, the background is transparent so the user's wallpaper shows through.
+    // Off by default (opaque black background).
+    transparent_background: bool,
 }
 
 impl Default for Config {
@@ -106,6 +109,7 @@ impl Default for Config {
             reactivity: 2,
             intro_beat_sync: true,
             use_theme_colors: true,
+            transparent_background: false,
         }
     }
 }
@@ -157,6 +161,7 @@ fn read_config() -> Config {
     if let Some(v) = json_num(&text, "reactivity") { cfg.reactivity = v; }
     if let Some(v) = json_bool(&text, "intro_beat_sync") { cfg.intro_beat_sync = v; }
     if let Some(v) = json_bool(&text, "use_theme_colors") { cfg.use_theme_colors = v; }
+    if let Some(v) = json_bool(&text, "transparent_background") { cfg.transparent_background = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     cfg
 }
@@ -242,6 +247,19 @@ fn hex_to_ansi(hex: &str) -> String {
         [r * 17, g * 17, b * 17]
     } else { [0, 0, 0] };
     format!("\x1b[38;2;{};{};{}m", bytes[0], bytes[1], bytes[2])
+}
+
+// Parse a hex color string (#RRGGBB) into (r, g, b) bytes. Returns None if invalid.
+fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some((r, g, b))
+    } else {
+        None
+    }
 }
 
 // Read the active Omarchy theme's colors.toml and return a map of color name -> ANSI code.
@@ -352,7 +370,7 @@ fn main() -> Result<()> {
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
         let reactivity = arg_value(&args, "--reactivity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let state = AudioState::start(false); // standalone --ttfx: no audio capture
-        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity);
+        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity, false);
     }
 
     gtk4::init()?;
@@ -596,6 +614,11 @@ fn spawn_layer_for_monitor(
     term.set_scrollback_lines(0);
     term.set_hexpand(true);
     term.set_vexpand(true);
+    // When transparent_background is enabled, make Vte's background transparent
+    // so the user's wallpaper shows through the empty cells.
+    if cfg.transparent_background {
+        term.set_color_background(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    }
     window.set_child(Some(&term));
 
     if cfg.running {
@@ -640,8 +663,13 @@ fn spawn_layer_for_monitor(
         argv.push(intro_beat_sync_arg.into());
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         // Pre-clear so Vte doesn't flash its "N by M cells" placeholder while
-        // the renderer's PTY is still connecting.
-        term.feed(b"\x1b[2J\x1b[H\x1b[40m");
+        // the renderer's PTY is still connecting. Use transparent background
+        // when the option is enabled.
+        if cfg.transparent_background {
+            term.feed(b"\x1b[2J\x1b[H");
+        } else {
+            term.feed(b"\x1b[2J\x1b[H\x1b[40m");
+        }
         let effect_for_log = effect.to_string();
         log_dbg(&format!("spawn_async: effect={effect_for_log} {cols}x{rows} intensity={} reactivity={} audio={} ttfx_text={} show_intro={}", cfg.intensity, cfg.reactivity, cfg.audio, cfg.ttfx_text, show_intro));
         term.spawn_async(
@@ -1211,7 +1239,7 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
 // advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
 // the music like the hand-rolled effects do. Loops so it runs as a continuous
 // background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
-fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, reactivity: i64) -> Result<()> {
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, reactivity: i64, use_theme_colors: bool) -> Result<()> {
     log_dbg(&format!("run_ttfx enter: effect={effect_name} {cols}x{rows} ttfx_text={ttfx_text} reactivity={reactivity} audio_enabled={audio_enabled}"));
     use clap::Parser;
     use std::io::Write;
@@ -1226,6 +1254,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     // change applies WITHOUT restarting the background (no respawn, no intro replay).
     let mut reactivity = reactivity;
     let mut frames = 0u32;
+    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
     loop {
         // Build the effect with default config via the clap parser (like upstream's
         // --random-effect), then drive it ourselves so we can pace it by audio.
@@ -1276,6 +1305,36 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
                     ttfx::utils::ansi::set_audio_color(true, bright, m);
                 } else {
                     ttfx::utils::ansi::set_audio_color(false, 1.0, [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]);
+                }
+            }
+            // Live theme color detection: when the user switches Omarchy themes,
+            // recolor the ttfx effect on the fly without restarting.
+            if use_theme_colors {
+                let new_colors = read_theme_colors();
+                if !new_colors.is_empty() {
+                    let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                    let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+                    if new_key != old_key {
+                        cached_theme_colors = new_colors.clone();
+                        let new_pal = theme_palette(&cached_theme_colors, effect_name);
+                        // Apply the theme palette to the ttfx engine via the global color hook.
+                        // Map the theme colors to a brightness/hue transform.
+                        if let Some(accent) = new_pal.first() {
+                            if let Some((r, g, b)) = parse_hex_color(accent) {
+                                let bright = 1.0;
+                                let rr = r as f32 / 255.0;
+                                let gg = g as f32 / 255.0;
+                                let bb = b as f32 / 255.0;
+                                let m = [
+                                    rr, 0.0, 0.0,
+                                    0.0, gg, 0.0,
+                                    0.0, 0.0, bb,
+                                ];
+                                ttfx::utils::ansi::set_audio_color(true, bright, m);
+                                log_dbg(&format!("ttfx theme colors changed: {effect_name} accent={accent}"));
+                            }
+                        }
+                    }
                 }
             }
             // Audio-reactive per-effect hook (e.g. thunderstorm lightning on loud beats).
@@ -1355,7 +1414,7 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
-        run_ttfx(effect, cols, rows, ttfx_text, &state, audio, reactivity);
+        run_ttfx(effect, cols, rows, ttfx_text, &state, audio, reactivity, cfg.use_theme_colors);
         return Ok(());
     }
 
