@@ -1316,11 +1316,10 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
                     let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
                     if new_key != old_key {
                         cached_theme_colors = new_colors.clone();
-                        let new_pal = theme_palette(&cached_theme_colors, effect_name);
-                        // Apply the theme palette to the ttfx engine via the global color hook.
-                        // Map the theme colors to a brightness/hue transform.
-                        if let Some(accent) = new_pal.first() {
-                            if let Some((r, g, b)) = parse_hex_color(accent) {
+                        // Find the accent color directly from the hex values (not ANSI).
+                        let accent_hex = cached_theme_colors.iter().find(|(k, _)| k == "accent").map(|(_, v)| v.clone());
+                        if let Some(accent) = accent_hex {
+                            if let Some((r, g, b)) = parse_hex_color(&accent) {
                                 let bright = 1.0;
                                 let rr = r as f32 / 255.0;
                                 let gg = g as f32 / 255.0;
