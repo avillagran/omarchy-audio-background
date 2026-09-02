@@ -105,7 +105,7 @@ impl Default for Config {
             resolution: 1,
             reactivity: 2,
             intro_beat_sync: true,
-            use_theme_colors: false,
+            use_theme_colors: true,
         }
     }
 }

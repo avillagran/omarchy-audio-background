@@ -74,7 +74,7 @@ Panel {
   function setPanelOpacity(v) { root.panelOpacity = v; write("panel_opacity=" + v); }
   // When true, use the active Omarchy theme colors for the effect palettes instead
   // of the built-in hardcoded colors. Requires omarchy-theme-current to be installed.
-  property bool useThemeColors: false
+  property bool useThemeColors: true
   function setUseThemeColors(v) { root.useThemeColors = v; write("use_theme_colors=" + (v ? "1" : "0")) }
   function toggleCollapsed() { root.collapsed = !root.collapsed; if (!root.collapsed) root.dragOffset = Qt.point(0,0) }
   // Cycle the active effect across the ENABLED set only (the user's selection).

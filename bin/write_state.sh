@@ -81,4 +81,4 @@ esac
 arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/\"&"/' | paste -sd, -)
 
 printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s,"resolution":%s,"reactivity":%s,"ttfx_text":"%s","panel_opacity":%s,"use_theme_colors":%s}\n' \
-  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" "$panel_opacity" "${use_theme_colors:-false}" > "$STATE"
+  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" "$panel_opacity" "${use_theme_colors:-true}" > "$STATE"
