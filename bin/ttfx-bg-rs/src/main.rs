@@ -45,6 +45,46 @@ fn get_theme_palette() -> Vec<String> {
     THEME_PALETTE.with(|p| p.borrow().clone())
 }
 
+// Throttled theme-color watcher: reads the theme files at most every `interval`
+// and reports only actual changes. Without this, the frame loop did 2 file reads
+// + TOML parse + string building at 60fps (~120 file opens/sec) — visible stutter
+// under disk load. Theme changes are user-initiated and rare; 500ms detection
+// latency is invisible.
+struct ThemeWatcher {
+    last_check: std::time::Instant,
+    interval: Duration,
+    cached: Vec<(String, String)>,
+    key: String,
+}
+
+impl ThemeWatcher {
+    fn new() -> Self {
+        Self {
+            last_check: std::time::Instant::now() - Duration::from_secs(60), // force first read
+            interval: Duration::from_millis(500),
+            cached: Vec::new(),
+            key: String::new(),
+        }
+    }
+    /// Returns the theme colors only when they changed since the last call
+    /// (and at most once per `interval`). Cheap no-op otherwise.
+    fn changed(&mut self) -> Option<&[(String, String)]> {
+        if self.last_check.elapsed() < self.interval {
+            return None;
+        }
+        self.last_check = std::time::Instant::now();
+        let new = read_theme_colors();
+        let new_key: String = new.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
+        if new_key != self.key {
+            self.key = new_key;
+            self.cached = new;
+            Some(&self.cached)
+        } else {
+            None
+        }
+    }
+}
+
 // Convert a tint index (0=default, 1..=palette.len()) to an ANSI color string.
 fn tint_to_color(tint: u8, palette: &[String]) -> String {
     if tint == 0 || palette.is_empty() {
@@ -1254,7 +1294,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     // change applies WITHOUT restarting the background (no respawn, no intro replay).
     let mut reactivity = reactivity;
     let mut frames = 0u32;
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         // Build the effect with default config via the clap parser (like upstream's
         // --random-effect), then drive it ourselves so we can pace it by audio.
@@ -1310,28 +1350,22 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             // Live theme color detection: when the user switches Omarchy themes,
             // recolor the ttfx effect on the fly without restarting.
             if use_theme_colors {
-                let new_colors = read_theme_colors();
-                if !new_colors.is_empty() {
-                    let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                    let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                    if new_key != old_key {
-                        cached_theme_colors = new_colors.clone();
-                        // Find the accent color directly from the hex values (not ANSI).
-                        let accent_hex = cached_theme_colors.iter().find(|(k, _)| k == "accent").map(|(_, v)| v.clone());
-                        if let Some(accent) = accent_hex {
-                            if let Some((r, g, b)) = parse_hex_color(&accent) {
-                                let bright = 1.0;
-                                let rr = r as f32 / 255.0;
-                                let gg = g as f32 / 255.0;
-                                let bb = b as f32 / 255.0;
-                                let m = [
-                                    rr, 0.0, 0.0,
-                                    0.0, gg, 0.0,
-                                    0.0, 0.0, bb,
-                                ];
-                                ttfx::utils::ansi::set_audio_color(true, bright, m);
-                                log_dbg(&format!("ttfx theme colors changed: {effect_name} accent={accent}"));
-                            }
+                if let Some(new_colors) = theme_watcher.changed() {
+                    // Find the accent color directly from the hex values (not ANSI).
+                    let accent_hex = new_colors.iter().find(|(k, _)| k == "accent").map(|(_, v)| v.clone());
+                    if let Some(accent) = accent_hex {
+                        if let Some((r, g, b)) = parse_hex_color(&accent) {
+                            let bright = 1.0;
+                            let rr = r as f32 / 255.0;
+                            let gg = g as f32 / 255.0;
+                            let bb = b as f32 / 255.0;
+                            let m = [
+                                rr, 0.0, 0.0,
+                                0.0, gg, 0.0,
+                                0.0, 0.0, bb,
+                            ];
+                            ttfx::utils::ansi::set_audio_color(true, bright, m);
+                            log_dbg(&format!("ttfx theme colors changed: {effect_name} accent={accent}"));
                         }
                     }
                 }
@@ -1470,21 +1504,15 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
     // so every cell always has a real hue (never the white default foreground).
     let mut cur_pal: Vec<String> = palette.to_vec();
     let mut col_pal: Vec<Vec<String>> = (0..cols).map(|_| palette.to_vec()).collect();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         // Detect theme changes live and update the palette future drops use.
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         let vol = audio.volume();
@@ -1552,20 +1580,14 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
 fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioState, use_theme_colors: bool, effect: &str) -> Result<()> {
     let mut t = 0f32;
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         scr.clear_dirty();
@@ -1596,20 +1618,14 @@ fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
     let bands = NBANDS;
     let mut heights = vec![0f32; bands];
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         scr.clear_dirty();
@@ -1649,20 +1665,14 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
     let sy = rows as f32 * (15.0 / 22.0);
     let mut zbuf = vec![0f32; cols * rows];
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         scr.clear_dirty();
@@ -1711,20 +1721,14 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
     let palette_chars: Vec<char> = " .:-=+*#%@".chars().collect();
     let mut heat = vec![vec![0u8; cols]; rows];
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         let lv = audio.volume();
@@ -1766,20 +1770,14 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
         rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(0.05..1.0),
     )).collect();
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         scr.clear_dirty();
@@ -1814,20 +1812,14 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
     for y in 0..rows { for x in 0..cols { grid[y][x] = rng.gen::<f32>() < density; } }
     let mut stagnant = 0u32;
     let mut cur_pal: Vec<String> = palette.to_vec();
-    let mut cached_theme_colors: Vec<(String, String)> = Vec::new();
+    let mut theme_watcher = ThemeWatcher::new();
     loop {
         if scr.maybe_resize() { return Ok(()); }
         if use_theme_colors {
-            let new_colors = read_theme_colors();
-            if !new_colors.is_empty() {
-                let new_key: String = new_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                let old_key: String = cached_theme_colors.iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("|");
-                if new_key != old_key {
-                    cached_theme_colors = new_colors.clone();
-                    cur_pal = theme_palette(&cached_theme_colors, effect);
-                    set_theme_palette(cur_pal.clone());
-                    log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
-                }
+            if let Some(new_colors) = theme_watcher.changed() {
+                cur_pal = theme_palette(new_colors, effect);
+                set_theme_palette(cur_pal.clone());
+                log_dbg(&format!("theme colors changed: {effect} palette updated ({})", cur_pal.len()));
             }
         }
         scr.clear_dirty();
