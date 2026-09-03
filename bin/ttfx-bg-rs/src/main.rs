@@ -717,6 +717,13 @@ fn rebuild_layers(
     for w in windows.borrow_mut().drain(..) {
         w.close();
     }
+    // Toggled off: leave NO layer window at all. The desktop then shows the
+    // default wallpaper instead of an empty black VTE covering the screen.
+    if !cfg.running {
+        println!("running=false: no layer windows, desktop wallpaper visible");
+        log_dbg("rebuild_layers: running=false, no windows spawned");
+        return;
+    }
     let display = match gdk::Display::default() {
         Some(d) => d,
         None => return,
