@@ -30,7 +30,7 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"audio"[^,}]*' "$STATE" || true);     [ -n "$v" ] && audio=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"show_fps"[^,}]*' "$STATE" || true);  [ -n "$v" ] && show_fps=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"boot_between"[^,}]*' "$STATE" || true); [ -n "$v" ] && boot_between=$(echo "$v" | grep -o '\(true\|false\)')
-  v=$(grep -o '"effect":[^,}]*"[^"]*"' "$STATE" || true); [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*"://; s/".*//')
+  v=$(grep -o '"effect"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATE" || true); [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*"effect"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
   v=$(grep -o '"intensity"[^,}]*' "$STATE" || true); [ -n "$v" ] && intensity=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"restart"[^,}]*' "$STATE" || true);   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"intro_size"[^,}]*' "$STATE" || true); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]\+')
@@ -83,4 +83,5 @@ esac
 arr=$(echo "$effects" | tr ' ' '\n' | sed 's/.*/\"&"/' | paste -sd, -)
 
 printf '{"running":%s,"audio":%s,"show_fps":%s,"boot_between":%s,"effect":"%s","effects":[%s],"intensity":%s,"byline":"%s","restart":%s,"intro_size":%s,"rotate_secs":%s,"resolution":%s,"reactivity":%s,"ttfx_text":"%s","panel_opacity":%s,"use_theme_colors":%s,"transparent_background":%s}\n' \
-  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" "$panel_opacity" "${use_theme_colors:-true}" "${transparent_background:-false}" > "$STATE"
+  "$running" "$audio" "$show_fps" "$boot_between" "$effect" "$arr" "$intensity" "$byline" "$restart" "$intro_size" "$rotate_secs" "$resolution" "$reactivity" "$ttfx_text" "$panel_opacity" "${use_theme_colors:-true}" "${transparent_background:-false}" > "$STATE.tmp.$$" \
+  && mv "$STATE.tmp.$$" "$STATE"

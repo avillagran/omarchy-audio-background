@@ -174,18 +174,32 @@ fn legacy_config_path() -> PathBuf {
 // Best-effort read of the panel's state.json. Missing/invalid => defaults.
 // Tolerant of compact or pretty JSON. Independent `if`s on purpose: a compact
 // line carries every key at once.
+// Last config that parsed successfully. read_config() returns this instead of
+// defaults when the state file is momentarily unreadable/empty (a non-atomic
+// writer truncates-then-writes; even with an atomic mv, reading mid-flight used
+// to return Config::default() = "matrix", and the controller interpreted that as
+// the user switching effects -> visible rebuild/restart every write).
+thread_local! {
+    static LAST_GOOD_CONFIG: RefCell<Option<Config>> = RefCell::new(None);
+}
+
 fn read_config() -> Config {
-    let mut cfg = Config::default();
-    // New XDG-state path first, legacy plugin-dir path as a one-time migration read.
     let text = std::fs::read_to_string(config_path())
         .or_else(|_| std::fs::read_to_string(legacy_config_path()));
+    // Empty or brace-less content = torn write window (or a corrupt file); never
+    // treat it as "user wants defaults".
     let text = match text {
-        Ok(t) => t,
+        Ok(t) if t.contains('{') => t,
+        Ok(t) => {
+            log_dbg(&format!("read_config: state file empty/partial ({} bytes) — keeping last good", t.len()));
+            return LAST_GOOD_CONFIG.with(|c| c.borrow().clone().unwrap_or_default());
+        }
         Err(e) => {
-            log_dbg(&format!("read_config: no state file ({e}) -> defaults effect={} effects={:?}", cfg.effect, cfg.effects));
-            return cfg;
+            log_dbg(&format!("read_config: no state file ({e}) — keeping last good"));
+            return LAST_GOOD_CONFIG.with(|c| c.borrow().clone().unwrap_or_default());
         }
     };
+    let mut cfg = Config::default();
     if let Some(v) = json_bool(&text, "running") { cfg.running = v; }
     if let Some(v) = json_bool(&text, "audio") { cfg.audio = v; }
     if let Some(v) = json_str(&text, "effect") { cfg.effect = v; }
@@ -203,6 +217,7 @@ fn read_config() -> Config {
     if let Some(v) = json_bool(&text, "use_theme_colors") { cfg.use_theme_colors = v; }
     if let Some(v) = json_bool(&text, "transparent_background") { cfg.transparent_background = v; }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
+    LAST_GOOD_CONFIG.with(|c| *c.borrow_mut() = Some(cfg.clone()));
     cfg
 }
 
