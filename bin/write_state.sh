@@ -50,7 +50,9 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"transparent_background"[^,}]*' "$STATE" || true); [ -n "$v" ] && transparent_background=$(echo "$v" | grep -o 'true\|false')
 fi
 
-arg="$1"
+# Accept multiple key=value args in one invocation (single read-modify-write
+# cycle — auto-degrade passes resolution=N and intro_size=M together).
+for arg in "$@"; do
 case "$arg" in
   running=*)  running=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
   audio=*)    audio=$([ "${arg#*=}" = "1" ] || [ "${arg#*=}" = "true" ] && echo true || echo false) ;;
@@ -75,6 +77,7 @@ case "$arg" in
     name="${arg#*-}"
     effects=$(echo " $effects " | sed "s/ $name / /" | xargs) ;;
 esac
+done
 
 # never let the effects list go empty
 [ -z "$effects" ] && effects="$effect"

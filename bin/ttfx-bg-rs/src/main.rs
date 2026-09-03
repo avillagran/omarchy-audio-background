@@ -85,6 +85,102 @@ impl ThemeWatcher {
     }
 }
 
+
+// --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
+// The panel's `resolution` setting scales cell size (bigger cells => fewer
+// cols/rows => less CPU). When the measured frame pace runs significantly
+// slower than the intended sleep for a sustained window, we bump resolution
+// one step and shrink the boot intro (intro_size=1) so it fits smaller
+// canvases, by rewriting state.json through write_state.sh — the controller
+// picks the change up and rebuilds without an effect switch.
+thread_local! {
+    static AUTO_DEGRADE: RefCell<AutoDegrade> = RefCell::new(AutoDegrade::new());
+    static AUTO_DEGRADE_ENABLED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn set_auto_degrade_enabled(on: bool) {
+    AUTO_DEGRADE_ENABLED.with(|e| e.set(on));
+}
+
+struct AutoDegrade {
+    last: Option<std::time::Instant>,
+    win_frames: u32,
+    win_actual_ms: f64,
+    win_intended_ms: f64,
+    win_since: std::time::Instant,
+    escalated: bool,
+}
+
+impl AutoDegrade {
+    fn new() -> Self {
+        Self {
+            last: None,
+            win_frames: 0,
+            win_actual_ms: 0.0,
+            win_intended_ms: 0.0,
+            win_since: std::time::Instant::now(),
+            escalated: false,
+        }
+    }
+
+    /// Call once per rendered frame with the delay the frame INTENDED to sleep.
+    fn tick(&mut self, intended_ms: f64) {
+        let enabled = AUTO_DEGRADE_ENABLED.with(|e| e.get());
+        let now = std::time::Instant::now();
+        if let (true, Some(last)) = (enabled, self.last) {
+            let actual_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+            self.win_frames += 1;
+            self.win_actual_ms += actual_ms;
+            self.win_intended_ms += intended_ms.max(1.0);
+        }
+        self.last = Some(now);
+        let win_elapsed = self.win_since.elapsed().as_secs_f64();
+        if win_elapsed >= 5.0 && self.win_frames >= 30 {
+            let ratio = self.win_actual_ms / self.win_intended_ms.max(1.0);
+            log_dbg(&format!("auto-degrade: window {} frames, actual/intended={:.2}", self.win_frames, ratio));
+            if ratio > 1.4 && !self.escalated {
+                self.escalated = true;
+                self.win_frames = 0;
+                self.win_actual_ms = 0.0;
+                self.win_intended_ms = 0.0;
+                self.win_since = std::time::Instant::now();
+                escalate_resolution();
+                return;
+            }
+            self.win_frames = 0;
+            self.win_actual_ms = 0.0;
+            self.win_intended_ms = 0.0;
+            self.win_since = std::time::Instant::now();
+        }
+    }
+}
+
+/// One-shot escalation: resolution+1 (cap 8) and intro_size -> 1 (smaller boot).
+/// Runs write_state.sh next to the current binary; the controller's 700ms poll
+/// sees the change and rebuilds. Once per process: the rebuild respawns us.
+fn escalate_resolution() {
+    let cfg = read_config();
+    if cfg.resolution >= 8 {
+        log_dbg("auto-degrade: resolution already at max (8), not escalating");
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(bin_dir) = exe.parent() else { return };
+    let script = bin_dir.join("write_state.sh");
+    if !script.exists() { return; }
+    let new_res = (cfg.resolution + 1).min(8);
+    let new_intro = if cfg.intro_size > 1 { 1 } else { cfg.intro_size };
+    log_dbg(&format!("auto-degrade: FPS drop detected -> resolution {res} -> {new_res}, intro_size {intro} -> {new_intro} (write via {script:?})",
+        res = cfg.resolution, intro = cfg.intro_size));
+    let _ = std::process::Command::new("sh")
+        .arg(&script)
+        .arg(format!("resolution={new_res}"))
+        .arg(format!("intro_size={new_intro}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 // Convert a tint index (0=default, 1..=palette.len()) to an ANSI color string.
 fn tint_to_color(tint: u8, palette: &[String]) -> String {
     if tint == 0 || palette.is_empty() {
@@ -908,9 +1004,11 @@ impl Screen {
         }
     }
     // Call once per frame; draws an FPS readout in the top-left corner when
-    // the user enabled it in preferences.
-    fn fps_overlay(&mut self) {
-        if !self.show_fps { return; }
+    // the user enabled it in preferences. `intended_ms` is the frame's intended
+    // sleep — feeding it to the auto-degrade watcher lets it detect sustained
+    // pacing drops (actual >> intended) and coarsen the grid.
+    fn fps_overlay(&mut self, intended_ms: f64) {
+        AUTO_DEGRADE.with(|a| a.borrow_mut().tick(intended_ms));
         self.fps_frames += 1;
         let el = self.fps_since.elapsed().as_secs_f32();
         if el >= 0.5 {
@@ -918,6 +1016,7 @@ impl Screen {
             self.fps_frames = 0;
             self.fps_since = std::time::Instant::now();
         }
+        if !self.show_fps { return; }
         let text = format!("FPS {:.0}", self.fps_value);
         for (i, ch) in text.chars().enumerate() {
             if i < self.cols { self.put(i, 0, ch, "\x1b[37m".to_string()); }
@@ -1181,7 +1280,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
         for step in 0..=title_len {
             scr.clear_dirty();
             draw(scr, &title, step, tx_title, ty, 1);
-            scr.fps_overlay();
+            scr.fps_overlay(70.0);
             scr.present();
             let beat_sync = wait_for_beat(audio, 1500);
             // If we got a beat, great; otherwise fall back to volume-paced delay.
@@ -1196,7 +1295,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
             scr.clear_dirty();
             draw(scr, &title, title_len, tx_title, ty, 1);
             draw(scr, &by, step, tx_by, by_y, 2);
-            scr.fps_overlay();
+            scr.fps_overlay(70.0);
             scr.present();
             let beat_sync = wait_for_beat(audio, 1500);
             if !beat_sync {
@@ -1210,7 +1309,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
         for step in 0..=title_len {
             scr.clear_dirty();
             draw(scr, &title, step, tx_title, ty, 1);
-            scr.fps_overlay();
+            scr.fps_overlay(70.0);
             scr.present();
             let vol = audio.volume().clamp(0.0, 1.0);
             let speed = 1.0 + vol * 2.5 + if audio.beat() { 1.0 } else { 0.0 };
@@ -1221,7 +1320,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
             scr.clear_dirty();
             draw(scr, &title, title_len, tx_title, ty, 1);
             draw(scr, &by, step, tx_by, by_y, 2);
-            scr.fps_overlay();
+            scr.fps_overlay(45.0);
             scr.present();
             let vol = audio.volume().clamp(0.0, 1.0);
             let speed = 1.0 + vol * 2.5 + if audio.beat() { 1.0 } else { 0.0 };
@@ -1234,7 +1333,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
     draw(scr, &title, title_len, tx_title, ty, 1);
     draw(scr, &by, by_len, tx_by, by_y, 2);
     draw(scr, &tag, tag_len, tx_tag, tag_y, 3);
-    scr.fps_overlay();
+    scr.fps_overlay(2600.0);
     scr.present();
     // Hold pulses with audio: beat shortens hold, quiet holds full 2600ms.
     let hold_base = 2600.0;
@@ -1411,7 +1510,9 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             let vol = audio.volume().clamp(0.0, 1.0);
             let boost = vol * reactivity as f32 + if audio.beat() { 0.5 } else { 0.0 };
             let speed = if audio_enabled && reactivity > 0 { (1.0 + boost).clamp(1.0, 3.0) } else { 1.0 };
-            thread::sleep(Duration::from_secs_f64(frame_secs / speed as f64));
+            let intended = Duration::from_secs_f64(frame_secs / speed as f64);
+            thread::sleep(intended);
+            AUTO_DEGRADE.with(|a| a.borrow_mut().tick(intended.as_secs_f64() * 1000.0));
         }
         let _ = ctx.terminal.restore_cursor(&mut out, "");
         // Continuous background: loop all ttfx effects for the full rotate_secs
@@ -1456,9 +1557,13 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
         set_theme_palette(palette.clone());
     }
 
+    set_auto_degrade_enabled(false);
     if with_intro {
         show_intro(&mut scr, &palette, byline, effect, intro_size, &state, intro_beat_sync);
     }
+    // From here on, sustained FPS drops auto-escalate the grid resolution and
+    // shrink the boot text (the intro replaying at the new size confirms it).
+    set_auto_degrade_enabled(true);
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
@@ -1585,9 +1690,10 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
                 }
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(40, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
-        thread::sleep(frame_delay(40, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1620,10 +1726,11 @@ fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(45, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         t += 0.12 + lv * 0.25;
-        thread::sleep(frame_delay(45, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1659,9 +1766,10 @@ fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(50, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
-        thread::sleep(frame_delay(50, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1719,12 +1827,13 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
             }
             j += 0.07;
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(45, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         let spin = 1.0 + lv * 2.0;
         a += 0.04 * spin;
         e += 0.02 * spin;
-        thread::sleep(frame_delay(45, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1767,9 +1876,10 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(45, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
-        thread::sleep(frame_delay(45, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1809,9 +1919,10 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
                 scr.put(px as usize, py as usize, ch, tint_to_color(tint, &cur_pal));
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(40, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
-        thread::sleep(frame_delay(40, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
 
@@ -1849,7 +1960,8 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        scr.fps_overlay();
+        let frame_dur = frame_delay(70, intensity, audio);
+        scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         let mut changed = 0u32;
         for y in 0..rows {
@@ -1876,6 +1988,6 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }}
             }
         } else { stagnant = 0; }
-        thread::sleep(frame_delay(70, intensity, audio));
+        thread::sleep(frame_dur);
     }
 }
