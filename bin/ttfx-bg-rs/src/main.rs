@@ -87,12 +87,14 @@ impl ThemeWatcher {
 
 
 // --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
-// The panel's `resolution` setting scales cell size (bigger cells => fewer
-// cols/rows => less CPU). When the measured frame pace runs significantly
-// slower than the intended sleep for a sustained window, we bump resolution
-// one step and shrink the boot intro (intro_size=1) so it fits smaller
-// canvases, by rewriting state.json through write_state.sh — the controller
-// picks the change up and rebuilds without an effect switch.
+const AUTO_DEGRADE_WINDOW_SECS: f64 = 15.0;
+const AUTO_DEGRADE_MIN_FPS: f64 = 10.0;
+
+fn should_auto_degrade(frames: u32, elapsed_secs: f64) -> bool {
+    elapsed_secs >= AUTO_DEGRADE_WINDOW_SECS
+        && frames as f64 / elapsed_secs.max(0.001) < AUTO_DEGRADE_MIN_FPS
+}
+
 thread_local! {
     static AUTO_DEGRADE: RefCell<AutoDegrade> = RefCell::new(AutoDegrade::new());
     static AUTO_DEGRADE_ENABLED: std::cell::Cell<bool> = std::cell::Cell::new(false);
@@ -100,13 +102,17 @@ thread_local! {
 
 fn set_auto_degrade_enabled(on: bool) {
     AUTO_DEGRADE_ENABLED.with(|e| e.set(on));
+    if on {
+        // The intro is intentionally unmeasured. Start a fresh 15-second window
+        // when real background rendering begins, otherwise intro time makes the
+        // first sample look artificially slow.
+        AUTO_DEGRADE.with(|a| *a.borrow_mut() = AutoDegrade::new());
+    }
 }
 
 struct AutoDegrade {
     last: Option<std::time::Instant>,
     win_frames: u32,
-    win_actual_ms: f64,
-    win_intended_ms: f64,
     win_since: std::time::Instant,
     escalated: bool,
 }
@@ -116,46 +122,60 @@ impl AutoDegrade {
         Self {
             last: None,
             win_frames: 0,
-            win_actual_ms: 0.0,
-            win_intended_ms: 0.0,
             win_since: std::time::Instant::now(),
             escalated: false,
         }
     }
 
-    /// Call once per rendered frame with the delay the frame INTENDED to sleep.
-    fn tick(&mut self, intended_ms: f64) {
+    /// Call once per rendered frame. Degrade only after a full, deliberately
+    /// slow 15-second observation window averaging below 10 real FPS.
+    fn tick(&mut self, _intended_ms: f64) {
         let enabled = AUTO_DEGRADE_ENABLED.with(|e| e.get());
         let now = std::time::Instant::now();
-        if let (true, Some(last)) = (enabled, self.last) {
-            let actual_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+        if enabled && self.last.is_some() {
             self.win_frames += 1;
-            self.win_actual_ms += actual_ms;
-            self.win_intended_ms += intended_ms.max(1.0);
         }
         self.last = Some(now);
         let win_elapsed = self.win_since.elapsed().as_secs_f64();
-        if win_elapsed >= 5.0 && self.win_frames >= 30 {
-            let ratio = self.win_actual_ms / self.win_intended_ms.max(1.0);
-            log_dbg(&format!("auto-degrade: window {} frames, actual/intended={:.2}", self.win_frames, ratio));
-            if ratio > 1.4 && !self.escalated {
+        if win_elapsed >= AUTO_DEGRADE_WINDOW_SECS {
+            let fps = self.win_frames as f64 / win_elapsed.max(0.001);
+            log_dbg(&format!("auto-degrade: {:.1}s window, {} frames, average={:.1} FPS", win_elapsed, self.win_frames, fps));
+            if should_auto_degrade(self.win_frames, win_elapsed) && !self.escalated {
                 self.escalated = true;
                 self.win_frames = 0;
-                self.win_actual_ms = 0.0;
-                self.win_intended_ms = 0.0;
                 self.win_since = std::time::Instant::now();
                 escalate_resolution();
                 return;
             }
             self.win_frames = 0;
-            self.win_actual_ms = 0.0;
-            self.win_intended_ms = 0.0;
             self.win_since = std::time::Instant::now();
         }
     }
 }
 
-/// One-shot escalation: resolution+1 (cap 8) and intro_size -> 1 (smaller boot).
+fn claim_auto_degrade_step() -> bool {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = format!("{base}/omarchy-audio-background-autodegrade-{}.lock", unsafe { libc::getuid() });
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).read(true).write(true).open(path) else { return false; };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 { return false; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs();
+    let mut previous = String::new();
+    let _ = file.read_to_string(&mut previous);
+    if now.saturating_sub(previous.trim().parse::<u64>().unwrap_or(0))
+        < AUTO_DEGRADE_WINDOW_SECS as u64
+    {
+        log_dbg("auto-degrade: another monitor already escalated this 15s window");
+        return false;
+    }
+    let _ = file.set_len(0);
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    write!(file, "{now}").is_ok()
+}
+
+/// One-step escalation: resolution+1 (cap 8) and intro_size -> 1 (smaller boot).
 /// Patches state.json IN-PROCESS (no child process, no PATH lookup, no script
 /// execution) with an atomic tmp+rename; the controller's 700ms poll sees the
 /// change and rebuilds. Once per process: the rebuild respawns us.
@@ -165,6 +185,7 @@ fn escalate_resolution() {
         log_dbg("auto-degrade: resolution already at max (8), not escalating");
         return;
     }
+    if !claim_auto_degrade_step() { return; }
     let new_res = (cfg.resolution + 1).min(8);
     let new_intro = if cfg.intro_size > 1 { 1 } else { cfg.intro_size };
     log_dbg(&format!("auto-degrade: FPS drop detected -> resolution {res} -> {new_res}, intro_size {intro} -> {new_intro}",
@@ -517,6 +538,14 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
     None
 }
 
+fn arm_parent_death_signal() {
+    let parent = unsafe { libc::getppid() };
+    if parent <= 1 { return; }
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM); }
+    // Parent may have died between getppid() and prctl().
+    if unsafe { libc::getppid() } != parent { std::process::exit(0); }
+}
+
 fn try_controller_lock() -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -557,6 +586,7 @@ fn main() -> Result<()> {
         return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity, false);
     }
 
+    arm_parent_death_signal();
     let _controller_lock = match try_controller_lock() {
         Some(lock) => lock,
         None => {
@@ -2088,4 +2118,14 @@ mod selective_theme_tests {
             assert!(ttfx_theme_transform(effect, &theme).is_none());
         }
     }
+
+    #[test]
+    fn auto_degrade_requires_full_sustained_sub_10_fps_window() {
+        assert!(!should_auto_degrade(90, 9.0));   // 10 FPS, but only 9 seconds
+        assert!(!should_auto_degrade(149, 14.99));
+        assert!(!should_auto_degrade(150, 15.0)); // exactly 10 FPS is healthy
+        assert!(should_auto_degrade(149, 15.0));  // 9.93 FPS for full window
+        assert!(should_auto_degrade(100, 20.0));  // 5 FPS sustained
+    }
+
 }
