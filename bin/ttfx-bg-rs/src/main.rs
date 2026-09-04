@@ -517,6 +517,15 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
     None
 }
 
+fn try_controller_lock() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = format!("{base}/omarchy-audio-background-{}.lock", unsafe { libc::getuid() });
+    let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(path).ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 { Some(file) } else { None }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--render") {
@@ -547,6 +556,14 @@ fn main() -> Result<()> {
         let state = AudioState::start(false); // standalone --ttfx: no audio capture
         return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity, false);
     }
+
+    let _controller_lock = match try_controller_lock() {
+        Some(lock) => lock,
+        None => {
+            log_dbg("controller already running; duplicate exits");
+            return Ok(());
+        }
+    };
 
     gtk4::init()?;
     let self_bin = std::env::current_exe()
@@ -1419,6 +1436,33 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
     canvas.iter().map(|row| row.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
 }
 
+fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option<ttfx::utils::ansi::ColorTransform> {
+    let accent = theme.iter().find(|(key, _)| key == "accent")
+        .and_then(|(_, value)| parse_hex_color(value))?;
+    match effect_name {
+        "burn" => {
+            use std::collections::HashSet;
+            use ttfx::utils::graphics::{Color, Gradient};
+            // Fire is semantic: preserve white-hot, yellow, orange and red,
+            // including every interpolated shade in the real burn gradient.
+            let stops = ["ffffff", "fff75d", "fe650d", "8A003C", "510100"].iter()
+                .map(|hex| Color::from_hex(hex).expect("valid burn color")).collect::<Vec<_>>();
+            let fire = Gradient::with_steps(&stops, 10, false).expect("valid burn gradient");
+            let protected: HashSet<(u8, u8, u8)> = fire.spectrum.iter()
+                .filter_map(|color| parse_hex_color(&color.rgb_color.to_string())).collect();
+            Some(Box::new(move |r, g, b| {
+                if (r, g, b) == (0, 0, 0) || protected.contains(&(r, g, b)) { return (r, g, b); }
+                let intensity = r.max(g).max(b) as u16;
+                ((accent.0 as u16 * intensity / 255) as u8,
+                 (accent.1 as u16 * intensity / 255) as u8,
+                 (accent.2 as u16 * intensity / 255) as u8)
+            }))
+        }
+        // No blanket tint: classify and approve every effect before enabling it.
+        _ => None,
+    }
+}
+
 // Drive a vendored ttfx effect on our Vte PTY, audio-reactively. The effect runs on
 // a VIRTUAL clock and we pace the frames by the live audio level — loud music
 // advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
@@ -1477,7 +1521,11 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
                 if active {
                     // Brightness 1.0..1.5 (reactivity 3 = stronger), hue up to ~60 deg from bass + vol.
                     let bright = 1.0 + vol * 0.45 * (reactivity as f32 / 2.0);
-                    let hue_deg = (bass * 45.0 + vol * 18.0) * (reactivity as f32 / 2.0) + if audio.beat() { 10.0 } else { 0.0 };
+                    let hue_deg = if effect_name == "burn" {
+                        0.0 // fire hue is semantic; audio may brighten it, never recolor it
+                    } else {
+                        (bass * 45.0 + vol * 18.0) * (reactivity as f32 / 2.0) + if audio.beat() { 10.0 } else { 0.0 }
+                    };
                     let rad = hue_deg.to_radians();
                     let (c, s) = (rad.cos(), rad.sin());
                     let t = 1.0 - c;
@@ -1492,28 +1540,17 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
                     ttfx::utils::ansi::set_audio_color(false, 1.0, [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]);
                 }
             }
-            // Live theme color detection: when the user switches Omarchy themes,
-            // recolor the ttfx effect on the fly without restarting.
+            // Effect-aware live theme mapping: semantic colors stay intact;
+            // only accents selected for this specific effect follow the theme.
             if use_theme_colors {
                 if let Some(new_colors) = theme_watcher.changed() {
-                    // Find the accent color directly from the hex values (not ANSI).
-                    let accent_hex = new_colors.iter().find(|(k, _)| k == "accent").map(|(_, v)| v.clone());
-                    if let Some(accent) = accent_hex {
-                        if let Some((r, g, b)) = parse_hex_color(&accent) {
-                            let bright = 1.0;
-                            let rr = r as f32 / 255.0;
-                            let gg = g as f32 / 255.0;
-                            let bb = b as f32 / 255.0;
-                            let m = [
-                                rr, 0.0, 0.0,
-                                0.0, gg, 0.0,
-                                0.0, 0.0, bb,
-                            ];
-                            ttfx::utils::ansi::set_audio_color(true, bright, m);
-                            log_dbg(&format!("ttfx theme colors changed: {effect_name} accent={accent}"));
-                        }
-                    }
+                    let accent = new_colors.iter().find(|(key, _)| key == "accent")
+                        .map(|(_, value)| value.as_str()).unwrap_or("unknown");
+                    ttfx::utils::ansi::set_color_transform(ttfx_theme_transform(effect_name, new_colors));
+                    log_dbg(&format!("ttfx theme colors changed: {effect_name} accent={accent}"));
                 }
+            } else {
+                ttfx::utils::ansi::set_color_transform(None);
             }
             // Audio-reactive per-effect hook (e.g. thunderstorm lightning on loud beats).
             // Runs before next_frame so the effect can inject a strike this tick.
@@ -2020,5 +2057,35 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
             }
         } else { stagnant = 0; }
         thread::sleep(frame_dur);
+    }
+}
+
+#[cfg(test)]
+mod selective_theme_tests {
+    use super::*;
+    use ttfx::utils::graphics::{Color, Gradient};
+
+    #[test]
+    fn burn_preserves_fire_and_themes_only_accents() {
+        let theme = vec![("accent".to_string(), "#204080".to_string())];
+        let transform = ttfx_theme_transform("burn", &theme).unwrap();
+        let stops = ["ffffff", "fff75d", "fe650d", "8A003C", "510100"].iter()
+            .map(|hex| Color::from_hex(hex).unwrap()).collect::<Vec<_>>();
+        for color in &Gradient::with_steps(&stops, 10, false).unwrap().spectrum {
+            let rgb = parse_hex_color(&color.rgb_color.to_string()).unwrap();
+            assert_eq!(transform(rgb.0, rgb.1, rgb.2), rgb, "fire color changed: {rgb:?}");
+        }
+        assert_eq!(transform(0, 0, 0), (0, 0, 0));
+        assert_eq!(transform(0, 195, 255), (32, 64, 128));
+        assert_eq!(transform(128, 128, 128), (16, 32, 64));
+    }
+
+    #[test]
+    fn unclassified_effects_are_not_blanket_tinted() {
+        let theme = vec![("accent".to_string(), "#204080".to_string())];
+        for effect in ["beams", "blackhole", "bubbles", "colorshift", "fireworks", "rings",
+                       "synthgrid", "thunderstorm", "vhstape", "swarm", "spray"] {
+            assert!(ttfx_theme_transform(effect, &theme).is_none());
+        }
     }
 }
