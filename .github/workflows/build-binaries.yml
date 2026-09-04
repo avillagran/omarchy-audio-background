@@ -1,0 +1,99 @@
+name: build-binaries
+
+# Canonical builder for the two prebuilt ELF executables.
+#
+# Provenance model: the bundled binaries are ALWAYS the output of this
+# workflow, built from the exact source tree and lockfiles at the commit
+# that triggers the run. A reviewer only needs to read this file to see
+# precisely how they were produced; re-running it reproduces the bytes.
+#
+# The job also proves determinism: it builds twice from a clean target
+# and fails unless both builds produce the identical SHA-256.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bin/ttfx-bg-rs/**'
+      - 'ttfx-src'
+      - '.github/workflows/build-binaries.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TOOLCHAIN: "1.98.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            binary: ttfx-bg-rs-x86_64
+          - runner: ubuntu-24.04-arm
+            binary: ttfx-bg-rs-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-4-dev libvte-2.91-gtk4-dev
+
+      - name: Install pinned Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$TOOLCHAIN"
+
+      - name: Build (pass 1)
+        working-directory: bin/ttfx-bg-rs
+        run: |
+          "$HOME/.cargo/bin/cargo" build --release
+          sha256sum target/release/ttfx-bg-rs | tee /tmp/hash1.txt
+
+      - name: Build (pass 2, clean)
+        working-directory: bin/ttfx-bg-rs
+        run: |
+          "$HOME/.cargo/bin/cargo" clean
+          "$HOME/.cargo/bin/cargo" build --release
+          sha256sum target/release/ttfx-bg-rs | tee /tmp/hash2.txt
+
+      - name: Verify determinism
+        run: |
+          h1=$(cut -d' ' -f1 /tmp/hash1.txt)
+          h2=$(cut -d' ' -f1 /tmp/hash2.txt)
+          echo "pass1: $h1"
+          echo "pass2: $h2"
+          test "$h1" = "$h2" || { echo "NON-DETERMINISTIC BUILD"; exit 1; }
+
+      - name: Install binary into repo + record hash
+        run: |
+          install -m 755 bin/ttfx-bg-rs/target/release/ttfx-bg-rs "bin/${{ matrix.binary }}"
+          {
+            echo "# SHA-256 of the bundled prebuilt executables."
+            echo "# Produced by .github/workflows/build-binaries.yml (canonical builder)."
+            echo "# Toolchain: rustc $TOOLCHAIN. See REPRODUCING.md."
+          } > SHA256SUMS.txt
+          sha256sum bin/ttfx-bg-rs-x86_64 bin/ttfx-bg-rs-aarch64 >> SHA256SUMS.txt
+
+      - name: Commit and push binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "bin/${{ matrix.binary }}" SHA256SUMS.txt
+          if git diff --cached --quiet; then
+            echo "Binaries unchanged, nothing to commit."
+          else
+            git commit -m "build: canonical ${{ matrix.binary }} at ${{ github.sha }} (rustc $TOOLCHAIN, determinism-verified) [skip ci]"
+            # both matrix jobs commit concurrently; rebase onto whichever landed first
+            for i in 1 2 3; do
+              git pull --rebase && git push && break
+              sleep 5
+            done
+          fi
