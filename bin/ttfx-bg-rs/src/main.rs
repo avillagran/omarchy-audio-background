@@ -1466,29 +1466,93 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
     canvas.iter().map(|row| row.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
 }
 
+type ThemeRgb = (u8, u8, u8);
+
+fn gradient_rgb_set(stops: &[&str], steps: i64) -> std::collections::HashSet<ThemeRgb> {
+    use ttfx::utils::graphics::{Color, Gradient};
+    let colors = stops.iter().map(|hex| Color::from_hex(hex).expect("valid effect color"))
+        .collect::<Vec<_>>();
+    Gradient::with_steps(&colors, steps, false).expect("valid effect gradient").spectrum.iter()
+        .filter_map(|color| parse_hex_color(&color.rgb_color.to_string())).collect()
+}
+
+fn theme_palette_mapper(theme: &[(String, String)]) -> impl Fn(u8, u8, u8) -> ThemeRgb + use<> {
+    let get = |key: &str, fallback: ThemeRgb| theme.iter().find(|(name, _)| name == key)
+        .and_then(|(_, value)| parse_hex_color(value)).unwrap_or(fallback);
+    let accent = get("accent", (128, 160, 255));
+    let foreground = get("foreground", accent);
+    let wheel = [
+        get("red", accent), get("yellow", accent), get("green", accent),
+        get("cyan", accent), get("blue", accent), get("magenta", accent), get("red", accent),
+    ];
+    move |r, g, b| {
+        if (r, g, b) == (0, 0, 0) { return (0, 0, 0); }
+        let rf = r as f32 / 255.0; let gf = g as f32 / 255.0; let bf = b as f32 / 255.0;
+        let max = rf.max(gf).max(bf); let min = rf.min(gf).min(bf); let delta = max - min;
+        let target = if delta / max.max(0.001) < 0.12 {
+            foreground
+        } else {
+            let hue = if max == rf { ((gf - bf) / delta).rem_euclid(6.0) }
+                else if max == gf { (bf - rf) / delta + 2.0 }
+                else { (rf - gf) / delta + 4.0 };
+            let index = hue.floor() as usize;
+            let fraction = hue - index as f32;
+            let a = wheel[index]; let z = wheel[index + 1];
+            (((a.0 as f32 + (z.0 as f32 - a.0 as f32) * fraction).round()) as u8,
+             ((a.1 as f32 + (z.1 as f32 - a.1 as f32) * fraction).round()) as u8,
+             ((a.2 as f32 + (z.2 as f32 - a.2 as f32) * fraction).round()) as u8)
+        };
+        ((target.0 as f32 * max).round() as u8,
+         (target.1 as f32 * max).round() as u8,
+         (target.2 as f32 * max).round() as u8)
+    }
+}
+
+fn final_accent_set(effect: &str) -> std::collections::HashSet<ThemeRgb> {
+    let (stops, steps): (&[&str], i64) = match effect {
+        "binarypath" => (&["00d500", "007500"], 12),
+        "blackhole" => (&["8A008A", "00D1FF", "ffffff"], 9),
+        "bubbles" => (&["d33aff", "02ff7f"], 12),
+        "crumble" => (&["5CE1FF", "FF8C00"], 12),
+        "decrypt" => (&["eda000"], 12),
+        "errorcorrect" | "fireworks" | "smoke" | "thunderstorm" | "unstable" =>
+            (&["8A008A", "00D1FF", "FFFFFF"], 12),
+        "laseretch" | "sweep" => (&["8A008A", "00D1FF", "ffffff"], 8),
+        "swarm" => (&["31b900", "f0ff65"], 12),
+        "synthgrid" => (&["8a008a", "00d1ff", "ffffff"], 12),
+        "vhstape" => (&["ab48ff", "e7b2b2", "fffebd"], 12),
+        _ => return std::collections::HashSet::new(),
+    };
+    gradient_rgb_set(stops, steps)
+}
+
 fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option<ttfx::utils::ansi::ColorTransform> {
-    let accent = theme.iter().find(|(key, _)| key == "accent")
-        .and_then(|(_, value)| parse_hex_color(value))?;
+    let map = theme_palette_mapper(theme);
     match effect_name {
-        "burn" => {
-            use std::collections::HashSet;
-            use ttfx::utils::graphics::{Color, Gradient};
-            // Fire is semantic: preserve white-hot, yellow, orange and red,
-            // including every interpolated shade in the real burn gradient.
-            let stops = ["ffffff", "fff75d", "fe650d", "8A003C", "510100"].iter()
-                .map(|hex| Color::from_hex(hex).expect("valid burn color")).collect::<Vec<_>>();
-            let fire = Gradient::with_steps(&stops, 10, false).expect("valid burn gradient");
-            let protected: HashSet<(u8, u8, u8)> = fire.spectrum.iter()
-                .filter_map(|color| parse_hex_color(&color.rgb_color.to_string())).collect();
-            Some(Box::new(move |r, g, b| {
-                if (r, g, b) == (0, 0, 0) || protected.contains(&(r, g, b)) { return (r, g, b); }
-                let intensity = r.max(g).max(b) as u16;
-                ((accent.0 as u16 * intensity / 255) as u8,
-                 (accent.1 as u16 * intensity / 255) as u8,
-                 (accent.2 as u16 * intensity / 255) as u8)
-            }))
+        // Their active rainbow/wave spectrum is the effect itself. The default final
+        // palette uses the same RGBs, so preserve-first means no safe recolor without
+        // scene-role provenance.
+        "colorshift" | "waves" => None,
+        // Physical/semantic effects: map only the unambiguous final-text spectrum.
+        "binarypath" | "blackhole" | "bubbles" | "crumble" | "decrypt" |
+        "errorcorrect" | "fireworks" | "laseretch" | "smoke" | "swarm" |
+        "sweep" | "synthgrid" | "thunderstorm" | "unstable" | "vhstape" => {
+            let accents = final_accent_set(effect_name);
+            Some(std::rc::Rc::new(move |r, g, b| if accents.contains(&(r, g, b)) {
+                map(r, g, b)
+            } else { (r, g, b) }))
         }
-        // No blanket tint: classify and approve every effect before enabling it.
+        "burn" => {
+            // Product decision: preserve the complete fire/ember spectrum. Starting,
+            // final and smoke accents may follow the host palette.
+            let fire = gradient_rgb_set(&["ffffff", "fff75d", "fe650d", "8A003C", "510100"], 10);
+            Some(std::rc::Rc::new(move |r, g, b| if fire.contains(&(r, g, b)) {
+                (r, g, b)
+            } else { map(r, g, b) }))
+        }
+        // Abstract/motion effects have no physically meaningful hue: all authored
+        // colors are decorative accents, mapped across the full theme color wheel.
+        _ if is_ttfx_effect(effect_name) => Some(std::rc::Rc::new(map)),
         _ => None,
     }
 }
@@ -2111,12 +2175,27 @@ mod selective_theme_tests {
     }
 
     #[test]
-    fn unclassified_effects_are_not_blanket_tinted() {
+    fn every_effect_has_a_safe_policy() {
         let theme = vec![("accent".to_string(), "#204080".to_string())];
-        for effect in ["beams", "blackhole", "bubbles", "colorshift", "fireworks", "rings",
-                       "synthgrid", "thunderstorm", "vhstape", "swarm", "spray"] {
-            assert!(ttfx_theme_transform(effect, &theme).is_none());
+        for effect in TTFX_EFFECTS {
+            let transform = ttfx_theme_transform(effect, &theme);
+            if ["colorshift", "waves"].contains(&effect) {
+                assert!(transform.is_none(), "{effect} has ambiguous semantic/final RGB collisions");
+            } else {
+                assert!(transform.is_some(), "{effect} has no theme policy");
+            }
         }
+    }
+
+    #[test]
+    fn semantic_effects_map_only_final_accents() {
+        let theme = vec![("accent".to_string(), "#204080".to_string())];
+        let blackhole = ttfx_theme_transform("blackhole", &theme).unwrap();
+        assert_eq!(blackhole(255, 204, 13), (255, 204, 13)); // explosion yellow
+        assert_eq!(blackhole(138, 0, 138), (17, 35, 69));   // final magenta, value preserved
+        let thunder = ttfx_theme_transform("thunderstorm", &theme).unwrap();
+        assert_eq!(thunder(104, 163, 232), (104, 163, 232)); // lightning blue
+        assert_eq!(thunder(138, 0, 138), (17, 35, 69));      // final magenta, value preserved
     }
 
     #[test]
@@ -2126,6 +2205,50 @@ mod selective_theme_tests {
         assert!(!should_auto_degrade(150, 15.0)); // exactly 10 FPS is healthy
         assert!(should_auto_degrade(149, 15.0));  // 9.93 FPS for full window
         assert!(should_auto_degrade(100, 20.0));  // 5 FPS sustained
+    }
+
+
+    #[test]
+    fn embedded_catalog_matches_every_upstream_effect_except_local_matrix_and_rain() {
+        use clap::CommandFactory;
+        let mut upstream: Vec<String> = ttfx::cli::Cli::command().get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .filter(|name| name != "matrix" && name != "rain").collect();
+        let mut embedded: Vec<String> = TTFX_EFFECTS.iter().map(|name| name.to_string()).collect();
+        upstream.sort(); embedded.sort();
+        assert_eq!(embedded, upstream);
+    }
+
+
+    #[test]
+    fn panel_catalog_matches_embedded_catalog() {
+        let panel = include_str!("../../../Panel.qml");
+        let block = panel.split("readonly property var ttfxEffects: [").nth(1).unwrap()
+            .split(']').next().unwrap();
+        let mut panel_names: Vec<String> = block.split('"').enumerate()
+            .filter_map(|(index, part)| if index % 2 == 1 { Some(part.to_string()) } else { None })
+            .collect();
+        let mut embedded: Vec<String> = TTFX_EFFECTS.iter().map(|name| name.to_string()).collect();
+        panel_names.sort(); embedded.sort();
+        assert_eq!(panel_names, embedded);
+    }
+
+
+    #[test]
+    fn every_safe_policy_changes_an_accent_between_two_themes() {
+        let warm = vec![("accent".to_string(), "#ff8040".to_string())];
+        let cool = vec![("accent".to_string(), "#4080ff".to_string())];
+        for effect in TTFX_EFFECTS {
+            if ["colorshift", "waves"].contains(&effect) { continue; }
+            let sample = if effect == "burn" {
+                (0, 195, 255)
+            } else {
+                final_accent_set(effect).iter().copied().next().unwrap_or((138, 0, 138))
+            };
+            let a = ttfx_theme_transform(effect, &warm).unwrap()(sample.0, sample.1, sample.2);
+            let b = ttfx_theme_transform(effect, &cool).unwrap()(sample.0, sample.1, sample.2);
+            assert_ne!(a, b, "{effect} did not react to theme change for {sample:?}");
+        }
     }
 
 }
