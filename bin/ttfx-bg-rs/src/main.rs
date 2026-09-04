@@ -156,29 +156,53 @@ impl AutoDegrade {
 }
 
 /// One-shot escalation: resolution+1 (cap 8) and intro_size -> 1 (smaller boot).
-/// Runs write_state.sh next to the current binary; the controller's 700ms poll
-/// sees the change and rebuilds. Once per process: the rebuild respawns us.
+/// Patches state.json IN-PROCESS (no child process, no PATH lookup, no script
+/// execution) with an atomic tmp+rename; the controller's 700ms poll sees the
+/// change and rebuilds. Once per process: the rebuild respawns us.
 fn escalate_resolution() {
     let cfg = read_config();
     if cfg.resolution >= 8 {
         log_dbg("auto-degrade: resolution already at max (8), not escalating");
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let Some(bin_dir) = exe.parent() else { return };
-    let script = bin_dir.join("write_state.sh");
-    if !script.exists() { return; }
     let new_res = (cfg.resolution + 1).min(8);
     let new_intro = if cfg.intro_size > 1 { 1 } else { cfg.intro_size };
-    log_dbg(&format!("auto-degrade: FPS drop detected -> resolution {res} -> {new_res}, intro_size {intro} -> {new_intro} (write via {script:?})",
+    log_dbg(&format!("auto-degrade: FPS drop detected -> resolution {res} -> {new_res}, intro_size {intro} -> {new_intro}",
         res = cfg.resolution, intro = cfg.intro_size));
-    let _ = std::process::Command::new("sh")
-        .arg(&script)
-        .arg(format!("resolution={new_res}"))
-        .arg(format!("intro_size={new_intro}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    patch_state_nums(&[("resolution", new_res), ("intro_size", new_intro)]);
+}
+
+/// Replace `"key":<int>` in the state file, preserving every other byte
+/// (including fields this binary doesn't know about, like panel_opacity).
+/// Writes tmp+rename so a concurrent reader never sees a torn file.
+fn patch_state_nums(patches: &[(&str, i64)]) {
+    use std::io::Write;
+    let path = config_path();
+    let text = std::fs::read_to_string(&path)
+        .or_else(|_| std::fs::read_to_string(legacy_config_path()));
+    let Ok(text) = text else {
+        log_dbg("auto-degrade: state file unreadable, skipping patch");
+        return;
+    };
+    let mut out = text;
+    for (key, value) in patches {
+        let needle = format!("\"{key}\":");
+        if let Some(pos) = out.find(&needle) {
+            let num_start = pos + needle.len();
+            let rest = &out[num_start..];
+            let num_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '-'))
+                .unwrap_or(rest.len());
+            out = format!("{}{}{}", &out[..num_start], value, &rest[num_len..]);
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(mut f) = std::fs::File::create(&tmp) {
+        if f.write_all(out.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }
 
 // Convert a tint index (0=default, 1..=palette.len()) to an ANSI color string.
