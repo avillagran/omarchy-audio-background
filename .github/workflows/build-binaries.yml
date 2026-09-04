@@ -7,8 +7,10 @@ name: build-binaries
 # that triggers the run. A reviewer only needs to read this file to see
 # precisely how they were produced; re-running it reproduces the bytes.
 #
-# The job also proves determinism: it builds twice from a clean target
-# and fails unless both builds produce the identical SHA-256.
+# Each matrix job builds twice from a clean target and fails unless both
+# builds produce the identical SHA-256 (determinism proof), then commits
+# its own binary. A final consolidate job regenerates SHA256SUMS.txt
+# over both committed binaries.
 
 on:
   push:
@@ -44,7 +46,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libgtk-4-dev libvte-2.91-gtk4-dev
+          sudo apt-get install -y pkg-config libgtk-4-dev libvte-2.91-gtk4-dev libgtk-4-layer-shell-dev
 
       - name: Install pinned Rust toolchain
         run: |
@@ -72,26 +74,46 @@ jobs:
           echo "pass2: $h2"
           test "$h1" = "$h2" || { echo "NON-DETERMINISTIC BUILD"; exit 1; }
 
-      - name: Install binary into repo + record hash
+      - name: Commit binary
         run: |
           install -m 755 bin/ttfx-bg-rs/target/release/ttfx-bg-rs "bin/${{ matrix.binary }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "bin/${{ matrix.binary }}"
+          if git diff --cached --quiet; then
+            echo "Binary unchanged, nothing to commit."
+          else
+            git commit -m "build: canonical ${{ matrix.binary }} at ${{ github.sha }} (rustc $TOOLCHAIN, determinism-verified) [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase && git push && break
+              sleep 5
+            done
+          fi
+
+  consolidate:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull binaries pushed by matrix jobs
+        run: git pull --ff-only
+
+      - name: Regenerate SHA256SUMS.txt
+        run: |
           {
             echo "# SHA-256 of the bundled prebuilt executables."
             echo "# Produced by .github/workflows/build-binaries.yml (canonical builder)."
             echo "# Toolchain: rustc $TOOLCHAIN. See REPRODUCING.md."
           } > SHA256SUMS.txt
           sha256sum bin/ttfx-bg-rs-x86_64 bin/ttfx-bg-rs-aarch64 >> SHA256SUMS.txt
-
-      - name: Commit and push binaries
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "bin/${{ matrix.binary }}" SHA256SUMS.txt
+          git add SHA256SUMS.txt
           if git diff --cached --quiet; then
-            echo "Binaries unchanged, nothing to commit."
+            echo "SHA256SUMS.txt already up to date."
           else
-            git commit -m "build: canonical ${{ matrix.binary }} at ${{ github.sha }} (rustc $TOOLCHAIN, determinism-verified) [skip ci]"
-            # both matrix jobs commit concurrently; rebase onto whichever landed first
+            git commit -m "build: refresh SHA256SUMS.txt [skip ci]"
             for i in 1 2 3; do
               git pull --rebase && git push && break
               sleep 5
