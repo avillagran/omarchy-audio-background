@@ -41,7 +41,13 @@ Panel {
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   // Vendored ttfx effects (rendered by the ttfx engine). matrix/rain stay hand-rolled
   // (ours are audio-reactive); these are the extra ttfx catalog worth offering.
-  readonly property var ttfxEffects: ["beams", "blackhole", "bubbles", "burn", "colorshift", "fireworks", "rings", "synthgrid", "thunderstorm", "vhstape", "swarm", "spray"]
+  readonly property var ttfxEffects: [
+    "beams", "binarypath", "blackhole", "bouncyballs", "bubbles", "burn", "colorshift",
+    "crumble", "decrypt", "errorcorrect", "expand", "fireworks", "highlight", "laseretch",
+    "middleout", "orbittingvolley", "overflow", "pour", "print", "randomsequence", "rings",
+    "scattered", "slice", "slide", "smoke", "spotlights", "spray", "swarm", "sweep",
+    "synthgrid", "thunderstorm", "unstable", "vhstape", "waves", "wipe"
+  ]
 
   // NOTE: opened / open / close / toggle / closeForPopoutSwitch are provided
   // by the qs.Ui.Panel base type — do NOT redeclare them (QML forbids
@@ -127,19 +133,20 @@ Panel {
           if (typeof s.running === "boolean") root.running = s.running
           if (typeof s.audio === "boolean")   root.audio = s.audio
           if (typeof s.show_fps === "boolean") root.showFps = s.show_fps
+          // Load the persisted enabled set BEFORE validating the active effect.
+          // Otherwise a shell/theme reload validates against the 8-item default
+          // and silently rewrites a valid ttfx selection back to matrix.
+          if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.effect === "string" && s.effect.trim() !== "") {
             root.effect = s.effect
-            // Validate: if the effect isn't in the enabled list, fall back to the first enabled
             if (root.effects.indexOf(root.effect) < 0 && root.effects.length > 0) {
               root.effect = root.effects[0]
               write("effect=" + root.effect)
             }
           } else if (root.effects && root.effects.length > 0 && root.effects.indexOf(root.effect) < 0) {
-            // State has empty/invalid effect; sync to first enabled
             root.effect = root.effects[0]
             write("effect=" + root.effect)
           }
-          if (Array.isArray(s.effects) && s.effects.length) root.effects = s.effects
           if (typeof s.intensity === "number") root.intensity = s.intensity
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
           if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
