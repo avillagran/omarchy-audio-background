@@ -1,0 +1,28 @@
+name: check-binary-hashes
+
+# Cheap integrity gate: confirms the bundled prebuilt executables still
+# match the hashes recorded in SHA256SUMS.txt. No compilation - the
+# canonical binaries are built on Arch Linux hosts per REPRODUCING.md;
+# this just catches accidental corruption or unrecorded replacement.
+
+on:
+  push:
+    paths:
+      - 'bin/ttfx-bg-rs-aarch64'
+      - 'bin/ttfx-bg-rs-x86_64'
+      - 'SHA256SUMS.txt'
+      - '.github/workflows/check-binary-hashes.yml'
+  pull_request:
+    paths:
+      - 'bin/ttfx-bg-rs-aarch64'
+      - 'bin/ttfx-bg-rs-x86_64'
+      - 'SHA256SUMS.txt'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify bundled binaries against recorded hashes
+        run: sha256sum -c SHA256SUMS.txt

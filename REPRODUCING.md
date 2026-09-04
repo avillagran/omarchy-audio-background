@@ -6,41 +6,21 @@ toolchain:
 - `bin/ttfx-bg-rs-aarch64`
 - `bin/ttfx-bg-rs-x86_64`
 
-## Canonical builder: the CI workflow
+## Canonical build environment
 
-**The bundled binaries are always the output of
-`.github/workflows/build-binaries.yml`.** That workflow is the complete,
-auditable recipe: it checks out the exact commit (with the `ttfx-src`
-submodule at its pinned commit), installs the pinned toolchain
-(`rustc 1.98.0` via rustup, declared as `TOOLCHAIN` in the workflow),
-installs the GTK4/VTE system dependencies, and builds the wrapper in
-release mode from `bin/ttfx-bg-rs` with the committed `Cargo.lock`.
+The binaries are built on **Arch Linux** hosts (the same distro family the
+plugin targets), at a **canonical checkout path** so no machine-specific
+paths are embedded in the binaries, with the pinned toolchain:
 
-Every run builds twice from a clean target directory and **fails unless
-both builds produce the identical SHA-256**, so the published binaries
-are provably deterministic for that source tree. The resulting hashes are
-committed to `SHA256SUMS.txt` in the same push, alongside the binaries
-themselves, by `github-actions[bot]`.
-
-To verify that a bundled binary matches the source at commit `X`:
-
-1. Confirm the binary was last touched in a
-   `build: canonical ...` commit by `github-actions[bot]`, whose parent
-   is `X` (or that the workflow ran on `X`).
-2. Re-run the workflow (`workflow_dispatch`) or push any change under
-   `bin/ttfx-bg-rs/` — the rebuilt hash must equal the one in
-   `SHA256SUMS.txt`, or the job fails.
-
-## What goes into a binary
-
-| Input | Location | Pinned by |
-|-------|----------|-----------|
-| Background wrapper source | `bin/ttfx-bg-rs/src/main.rs` | git commit |
-| Wrapper dependency lockfile | `bin/ttfx-bg-rs/Cargo.lock` | git commit |
-| ttfx effects engine (vendored) | `ttfx-src/` git submodule | submodule commit + `.gitmodules` URL/branch |
-| ttfx dependency lockfile | `ttfx-src/Cargo.lock` | submodule commit |
-| Rust toolchain | `rustc 1.98.0` | `TOOLCHAIN` env in the workflow |
-| Release profile (lto, strip, codegen-units) | `bin/ttfx-bg-rs/Cargo.toml` | git commit |
+| Input | Value | Pinned by |
+|-------|-------|-----------|
+| Distro | Arch Linux (rolling, gtk4 4.22.x, vte4 0.84.x, gtk4-layer-shell 1.3.0) | host |
+| Rust toolchain | `rustc 1.98.0 (88d9e12ae 2026-08-18)` | `rustup default 1.98.0` |
+| Wrapper source | `bin/ttfx-bg-rs/src/main.rs` | git commit |
+| Wrapper lockfile | `bin/ttfx-bg-rs/Cargo.lock` | git commit |
+| ttfx engine (vendored) | `ttfx-src/` git submodule @ `7e4a9b2` | submodule pointer + `.gitmodules` |
+| ttfx lockfile | `ttfx-src/Cargo.lock` | submodule commit |
+| Release profile | `lto=true`, `strip=true`, `codegen-units=1` | `bin/ttfx-bg-rs/Cargo.toml` |
 
 The submodule URL is `https://github.com/avillagran/ttfx` branch
 `audio-background-vendor`, which carries the two engine commits this
@@ -49,20 +29,49 @@ plugin builds on top of upstream ttfx 0.3.2:
 - `d6c4046` — audio-reactive color: global sgr_color hook
 - `7e4a9b2` — audio-reactive thunderstorm (on_audio reference impl)
 
-## Reproducing locally
-
-The workflow environment is Ubuntu 24.04 (x86_64 and arm64 runners) with
-the packages listed above. Any drift in compiler or linker compared to
-that environment can change the bytes, which is exactly why the CI
-workflow — not a developer laptop — is the canonical builder. For local
-reproduction of the *exact* bundled bytes, re-run the workflow rather
-than building by hand. For a local build that is functionally identical
-but not necessarily byte-identical:
+## Reproduce byte-for-byte
 
 ```sh
-git clone https://github.com/avillagran/omarchy-audio-background.git
-cd omarchy-audio-background
+# Canonical path - this exact directory matters: it is what gets baked
+# into the binary instead of the builder's home directory.
+CANON=/tmp/oab-build
+rm -rf "$CANON" && mkdir -p "$CANON"
+
+git clone https://github.com/avillagran/omarchy-audio-background.git "$CANON/src"
+cd "$CANON/src"
+git checkout <commit-you-are-verifying>
 git submodule update --init
+
+# Pinned toolchain
+rustup default 1.98.0
+
+# Arch build deps: base-devel rustup gtk4 gtk4-layer-shell vte4
+
 cd bin/ttfx-bg-rs
-cargo build --release          # needs rust 1.98.0 + gtk4 + vte dev libs
+cargo build --release
+sha256sum target/release/ttfx-bg-rs
 ```
+
+Compare the result against `SHA256SUMS.txt` in the repo root and against
+the bundled binary for your architecture:
+
+```sh
+sha256sum -c SHA256SUMS.txt          # checks BOTH bundled binaries
+```
+
+A green `sha256sum -c` means the bytes a user installs are exactly what
+the reviewed source and lockfiles produce. The repository's CI runs the
+same check on every change that touches the binaries
+(`.github/workflows/check-binary-hashes.yml`), so a binary can never
+drift from its recorded hash undetected.
+
+## Determinism evidence
+
+- Two consecutive `cargo build --release` runs from the same tree at the
+  canonical path produce identical SHA-256 (verified repeatedly during
+  development, including after `cargo clean`).
+- Builds from different checkout paths do NOT hash identically: rustc
+  embeds source paths in panic-location strings. The canonical path
+  `/tmp/oab-build/src` is part of the recipe for that reason.
+- Cross-distro rebuilds (e.g. Ubuntu) may also differ in system-library
+  linkage details; use Arch for an exact match.
