@@ -85,6 +85,61 @@ impl ThemeWatcher {
     }
 }
 
+// Slider updates are sampled at a bounded rate by the renderer. This avoids
+// killing the PTY and replaying an effect whenever the user drags intensity.
+struct IntensityWatcher {
+    last_check: std::time::Instant,
+    intensity: i64,
+}
+
+impl IntensityWatcher {
+    fn current(&mut self, fallback: i64) -> i64 {
+        if self.last_check.elapsed() >= Duration::from_millis(250) {
+            self.last_check = std::time::Instant::now();
+            self.intensity = read_config().intensity.clamp(0, 10);
+        }
+        if self.intensity == -1 { fallback.clamp(0, 10) } else { self.intensity }
+    }
+}
+
+thread_local! {
+    static INTENSITY_WATCHER: RefCell<IntensityWatcher> = RefCell::new(IntensityWatcher {
+        last_check: std::time::Instant::now() - Duration::from_secs(60),
+        intensity: -1,
+    });
+}
+
+fn live_intensity(fallback: i64) -> i64 {
+    INTENSITY_WATCHER.with(|watcher| watcher.borrow_mut().current(fallback))
+}
+
+// Speed is a separate live setting: visual intensity and audio reactivity must
+// not be the only ways to change animation pace.
+struct SpeedWatcher {
+    last_check: std::time::Instant,
+    speed: i64,
+}
+
+impl SpeedWatcher {
+    fn current(&mut self, fallback: i64) -> i64 {
+        if self.last_check.elapsed() >= Duration::from_millis(250) {
+            self.last_check = std::time::Instant::now();
+            self.speed = read_config().speed.clamp(1, 10);
+        }
+        if self.speed == -1 { fallback.clamp(1, 10) } else { self.speed }
+    }
+}
+
+thread_local! {
+    static SPEED_WATCHER: RefCell<SpeedWatcher> = RefCell::new(SpeedWatcher {
+        last_check: std::time::Instant::now() - Duration::from_secs(60),
+        speed: -1,
+    });
+}
+
+fn live_speed(fallback: i64) -> i64 {
+    SPEED_WATCHER.with(|watcher| watcher.borrow_mut().current(fallback))
+}
 
 // --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
 const AUTO_DEGRADE_WINDOW_SECS: f64 = 15.0;
@@ -244,6 +299,8 @@ struct Config {
     effect: String,
     effects: Vec<String>,
     intensity: i64,
+    // Overall animation pace, separate from visual intensity and audio reactivity.
+    speed: i64,
     audio: bool,
     byline: String,
     restart: i64,
@@ -269,6 +326,11 @@ struct Config {
     // When true, the background is transparent so the user's wallpaper shows through.
     // Off by default (opaque black background).
     transparent_background: bool,
+    // Glyph treatment for the input text animated by ttfx; effect symbols stay native.
+    char_style: String,
+    // Glyph treatment for the boot intro's ASCII-art letters. It is deliberately
+    // independent from the TTFX input text and hand-rolled effects.
+    boot_char_style: String,
 }
 
 impl Default for Config {
@@ -278,6 +340,7 @@ impl Default for Config {
             effect: "matrix".into(),
             effects: DEFAULT_EFFECTS.iter().map(|s| s.to_string()).collect(),
             intensity: 5,
+            speed: 5,
             audio: true,
             byline: String::new(),
             restart: 0,
@@ -291,6 +354,8 @@ impl Default for Config {
             intro_beat_sync: true,
             use_theme_colors: true,
             transparent_background: false,
+            char_style: "native".into(),
+            boot_char_style: "native".into(),
         }
     }
 }
@@ -346,6 +411,7 @@ fn read_config() -> Config {
     if let Some(v) = json_str(&text, "effect") { cfg.effect = v; }
     if let Some(v) = json_str(&text, "byline") { cfg.byline = v; }
     if let Some(v) = json_num(&text, "intensity") { cfg.intensity = v; }
+    if let Some(v) = json_num(&text, "speed") { cfg.speed = v.clamp(1, 10); }
     if let Some(v) = json_num(&text, "restart") { cfg.restart = v; }
     if let Some(v) = json_num(&text, "intro_size") { cfg.intro_size = v; }
     if let Some(v) = json_bool(&text, "show_fps") { cfg.show_fps = v; }
@@ -357,6 +423,8 @@ fn read_config() -> Config {
     if let Some(v) = json_bool(&text, "intro_beat_sync") { cfg.intro_beat_sync = v; }
     if let Some(v) = json_bool(&text, "use_theme_colors") { cfg.use_theme_colors = v; }
     if let Some(v) = json_bool(&text, "transparent_background") { cfg.transparent_background = v; }
+    if let Some(v) = json_str(&text, "char_style") { cfg.char_style = sanitize_char_style(&v).into(); }
+    if let Some(v) = json_str(&text, "boot_char_style") { cfg.boot_char_style = sanitize_char_style(&v).into(); }
     if let Some(v) = json_str_list(&text, "effects") { if !v.is_empty() { cfg.effects = v; } }
     LAST_GOOD_CONFIG.with(|c| *c.borrow_mut() = Some(cfg.clone()));
     cfg
@@ -407,6 +475,37 @@ fn json_str_list(text: &str, key: &str) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+fn sanitize_char_style(style: &str) -> &'static str {
+    match style {
+        "block" => "block",
+        "dark" => "dark",
+        "medium" => "medium",
+        "light" => "light",
+        "hash" => "hash",
+        "dot" => "dot",
+        "lower_o" => "lower_o",
+        "upper_o" => "upper_o",
+        _ => "native",
+    }
+}
+
+fn styled_glyph(style: &str, ch: char) -> char {
+    if ch == ' ' {
+        return ch;
+    }
+    match sanitize_char_style(style) {
+        "block" => '█',
+        "dark" => '▓',
+        "medium" => '▒',
+        "light" => '░',
+        "hash" => '#',
+        "dot" => '·',
+        "lower_o" => 'o',
+        "upper_o" => 'O',
+        _ => ch,
+    }
 }
 
 // Parse a simple TOML colors.toml file from Omarchy themes.
@@ -562,6 +661,7 @@ fn main() -> Result<()> {
         let cols = arg_value(&args, "--cols").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
         let rows = arg_value(&args, "--rows").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
+        let speed = arg_value(&args, "--speed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5).clamp(1, 10);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
@@ -572,7 +672,7 @@ fn main() -> Result<()> {
         let show_intro = !args.iter().any(|a| a == "--no-intro");
         let cfg = read_config();
         let intro_beat_sync = arg_value(&args, "--intro-beat-sync").map(|s| s == "1").unwrap_or(cfg.intro_beat_sync);
-        return run_render(&cfg, &effect, cols, rows, intensity, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text, reactivity, intro_beat_sync);
+        return run_render(&cfg, &effect, cols, rows, intensity, speed, audio, &byline, intro_size, cell_aspect, show_fps, show_intro, &ttfx_text, reactivity, intro_beat_sync);
     }
 
     // Drive a vendored ttfx effect directly (library bridge proof).
@@ -583,7 +683,8 @@ fn main() -> Result<()> {
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
         let reactivity = arg_value(&args, "--reactivity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let state = AudioState::start(false); // standalone --ttfx: no audio capture
-        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, reactivity, false);
+        let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
+        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, 5, 5, reactivity, false, "native", show_fps);
     }
 
     arm_parent_death_signal();
@@ -665,30 +766,34 @@ fn main() -> Result<()> {
                     }
                 }
                 *lc.borrow_mut() = cfg.clone();
-                // boot_between / rotate_secs are read live by the rotation timer, so a
-                // change to ONLY those shouldn't respawn the background (and replay the
-                // intro). Rebuild only when a structural/visual field actually changed.
+                // Rotation timing and intensity are applied by the running renderer.
+                // Keep the layer alive for those controls: killing its PTY on every
+                // slider tick was the visible "restart" users reported.
                 let visual = cfg.running != old.running
                     || cfg.effect != old.effect
                     || cfg.effects != old.effects
-                    || cfg.intensity != old.intensity
                     || cfg.audio != old.audio
                     || cfg.byline != old.byline
                     || cfg.ttfx_text != old.ttfx_text
                     || cfg.restart != old.restart
                     || cfg.intro_size != old.intro_size
                     || cfg.show_fps != old.show_fps
-                    || cfg.resolution != old.resolution;
-                // Rebuild only when a structural/visual field actually changed. Changing
-                // a slider (intensity, reactivity — the latter is applied live by the
-                // renderer) or a rotation toggle should NOT replay the boot intro (that's
-                // the jarring "restart" the user sees). Intro only on a real effect switch,
-                // explicit restart, or an intro-affecting field (byline/intro_size).
-                let intro = cfg.effect != old.effect
+                    || cfg.resolution != old.resolution
+                    || cfg.intro_beat_sync != old.intro_beat_sync
+                    || cfg.use_theme_colors != old.use_theme_colors
+                    || cfg.transparent_background != old.transparent_background
+                    || cfg.char_style != old.char_style
+                    || cfg.boot_char_style != old.boot_char_style;
+                // Boot Between Backgrounds controls every ordinary effect transition,
+                // including a manual picker selection. Explicit restart and changes to
+                // intro content still deliberately replay it.
+                let intro = (cfg.effect != old.effect && cfg.boot_between)
                     || cfg.restart != old.restart
                     || cfg.intro_size != old.intro_size
                     || cfg.ttfx_text != old.ttfx_text
-                    || cfg.byline != old.byline;
+                    || cfg.byline != old.byline
+                    || cfg.intro_beat_sync != old.intro_beat_sync
+                    || cfg.boot_char_style != old.boot_char_style;
                 if visual {
                     rebuild_layers(&w, &b, &cfg, &ae.borrow(), intro);
                 }
@@ -779,11 +884,12 @@ fn rebuild_layers(
     effect: &str,
     show_intro: bool,
 ) {
-    log_dbg(&format!("rebuild_layers: effect={effect} show_intro={show_intro} running={} audio={} intensity={} reactivity={} resolution={} rotate_secs={} effect_field={} effects={:?} ttfx_text={}", cfg.running, cfg.audio, cfg.intensity, cfg.reactivity, cfg.resolution, cfg.rotate_secs, cfg.effect, cfg.effects, cfg.ttfx_text));
-    // Kill renderer subprocesses from a previous build. The pattern `--render`
-    // only matches the child renderers, never this parent binary.
+    log_dbg(&format!("rebuild_layers: effect={effect} show_intro={show_intro} running={} audio={} intensity={} reactivity={} resolution={} rotate_secs={} boot_between={} effect_field={} effects={:?} ttfx_text={}", cfg.running, cfg.audio, cfg.intensity, cfg.reactivity, cfg.resolution, cfg.rotate_secs, cfg.boot_between, cfg.effect, cfg.effects, cfg.ttfx_text));
+    // Kill only OUR direct renderer children. A broad `pkill -f` also matched
+    // unrelated terminal commands that happened to inspect renderer arguments,
+    // terminating the caller during a rotation/rebuild.
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "ttfx-bg-rs-.* --render"])
+        .args(["-TERM", "-P", &std::process::id().to_string()])
         .output();
     for w in windows.borrow_mut().drain(..) {
         w.close();
@@ -875,6 +981,7 @@ fn spawn_layer_for_monitor(
             "--cols".into(), cols.to_string(),
             "--rows".into(), rows.to_string(),
             "--intensity".into(), cfg.intensity.to_string(),
+            "--speed".into(), cfg.speed.to_string(),
             "--audio".into(), audio.into(),
             "--byline".into(), byline,
             "--ttfx-text".into(), cfg.ttfx_text.clone(),
@@ -900,7 +1007,7 @@ fn spawn_layer_for_monitor(
             term.feed(b"\x1b[2J\x1b[H\x1b[40m");
         }
         let effect_for_log = effect.to_string();
-        log_dbg(&format!("spawn_async: effect={effect_for_log} {cols}x{rows} intensity={} reactivity={} audio={} ttfx_text={} show_intro={}", cfg.intensity, cfg.reactivity, cfg.audio, cfg.ttfx_text, show_intro));
+        log_dbg(&format!("spawn_async: effect={effect_for_log} {cols}x{rows} intensity={} speed={} reactivity={} audio={} ttfx_text={} show_intro={}", cfg.intensity, cfg.speed, cfg.reactivity, cfg.audio, cfg.ttfx_text, show_intro));
         term.spawn_async(
             vte4::PtyFlags::DEFAULT,
             None,
@@ -1081,7 +1188,8 @@ impl Screen {
             fps_value: 0.0,
         }
     }
-    // Call once per frame; draws an FPS readout in the top-left corner when
+    // Call once per frame; draw the FPS readout at bottom-left, clear of the
+    // persistent Omarchy bar that covers the top terminal rows.
     // the user enabled it in preferences. `intended_ms` is the frame's intended
     // sleep — feeding it to the auto-degrade watcher lets it detect sustained
     // pacing drops (actual >> intended) and coarsen the grid.
@@ -1096,8 +1204,9 @@ impl Screen {
         }
         if !self.show_fps { return; }
         let text = format!("FPS {:.0}", self.fps_value);
+        let row = self.rows.saturating_sub(1);
         for (i, ch) in text.chars().enumerate() {
-            if i < self.cols { self.put(i, 0, ch, "\x1b[37m".to_string()); }
+            if i < self.cols { self.put(i, row, ch, "\x1b[37m".to_string()); }
         }
     }
     fn clear(&mut self) {
@@ -1306,7 +1415,7 @@ fn art_width(text: &str, scale: usize, gap: usize) -> usize {
 // ×1..×3), centered on BOTH axes as a single stack. The title types in letter by
 // letter, then the byline, then the effect tag, then it holds.
 // Audio-reactive: each letter step pulses to the beat (volume/beat => faster typing).
-fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, intro_size: i64, audio: &AudioState, intro_beat_sync: bool) {
+fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, intro_size: i64, audio: &AudioState, intro_beat_sync: bool, boot_char_style: &str) {
     let scale = intro_size.clamp(1, 3) as usize;
     let gap = scale.max(1); // spaces between ASCII-art letters
     let title = "OMARCHY AUDIO BACKGROUND".to_string();
@@ -1334,7 +1443,7 @@ fn show_intro(scr: &mut Screen, palette: &[String], byline: &str, effect: &str, 
     let draw = |scr: &mut Screen, text: &str, upto: usize, x: usize, y: usize, color: u8| {
         for (r, line) in art_prefix(text, upto, scale, gap).iter().enumerate() {
             for (i, ch) in line.chars().enumerate() {
-                if ch != ' ' { scr.put(x + i, y + r, ch, tint_to_color(color, palette)); }
+                if ch != ' ' { scr.put(x + i, y + r, styled_glyph(boot_char_style, ch), tint_to_color(color, palette)); }
             }
         }
     };
@@ -1442,7 +1551,7 @@ fn is_valid_effect(name: &str) -> bool { DEFAULT_EFFECTS.contains(&name) || is_t
 // Canvas input for ttfx effects: the configured text rendered as centered ASCII art —
 // big enough that the effect animates a real readable word (ttfx effects animate
 // text, so they need real content, not sparse noise).
-fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
+fn ttfx_canvas_input(text: &str, cols: usize, rows: usize, char_style: &str) -> String {
     let t = prep(text);
     let n = t.chars().count().max(1);
     // Scale to fill ~70% of the width, capped by ~60% of the height.
@@ -1459,7 +1568,7 @@ fn ttfx_canvas_input(text: &str, cols: usize, rows: usize) -> String {
     for (r, line) in art.iter().enumerate() {
         for (i, ch) in line.chars().enumerate() {
             if ch != ' ' && top + r < rows && left + i < cols {
-                canvas[top + r][left + i] = ch;
+                canvas[top + r][left + i] = styled_glyph(char_style, ch);
             }
         }
     }
@@ -1529,10 +1638,11 @@ fn final_accent_set(effect: &str) -> std::collections::HashSet<ThemeRgb> {
 fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option<ttfx::utils::ansi::ColorTransform> {
     let map = theme_palette_mapper(theme);
     match effect_name {
-        // Their active rainbow/wave spectrum is the effect itself. The default final
-        // palette uses the same RGBs, so preserve-first means no safe recolor without
-        // scene-role provenance.
-        "colorshift" | "waves" => None,
+        // These were deliberately left unthemed when the initial catalog landed,
+        // which made Colorshift and Waves ignore the user's theme entirely. They
+        // are abstract effects, so their colors are decorative rather than semantic:
+        // map their full spectrum like the rest of the abstract catalog.
+        "colorshift" | "waves" => Some(std::rc::Rc::new(map)),
         // Physical/semantic effects: map only the unambiguous final-text spectrum.
         "binarypath" | "blackhole" | "bubbles" | "crumble" | "decrypt" |
         "errorcorrect" | "fireworks" | "laseretch" | "smoke" | "swarm" |
@@ -1562,7 +1672,7 @@ fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option
 // advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
 // the music like the hand-rolled effects do. Loops so it runs as a continuous
 // background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
-fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, reactivity: i64, use_theme_colors: bool) -> Result<()> {
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, intensity: i64, speed: i64, reactivity: i64, use_theme_colors: bool, char_style: &str, show_fps: bool) -> Result<()> {
     log_dbg(&format!("run_ttfx enter: effect={effect_name} {cols}x{rows} ttfx_text={ttfx_text} reactivity={reactivity} audio_enabled={audio_enabled}"));
     use clap::Parser;
     use std::io::Write;
@@ -1577,6 +1687,9 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     // change applies WITHOUT restarting the background (no respawn, no intro replay).
     let mut reactivity = reactivity;
     let mut frames = 0u32;
+    let mut fps_frames = 0u32;
+    let mut fps_since = std::time::Instant::now();
+    let mut fps_value = 0.0f32;
     let mut theme_watcher = ThemeWatcher::new();
     loop {
         // Build the effect with default config via the clap parser (like upstream's
@@ -1586,7 +1699,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             _ => { let m = format!("unknown ttfx effect: {effect_name}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
         };
         // Canvas = the configured text as centered ASCII art (rebuilt each pass).
-        let input = ttfx_canvas_input(ttfx_text, cols, rows);
+        let input = ttfx_canvas_input(ttfx_text, cols, rows, char_style);
         let mut config = TerminalConfig::default();
         config.canvas_width = cols as i64;
         config.canvas_height = rows as i64;
@@ -1657,32 +1770,60 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             // Stop if the PTY went away (effect settled / terminal gone).
             let frame = match effect.next_frame(&mut ctx) { Some(f) => f, None => break };
             if ctx.terminal.print_frame(&mut out, &frame).is_err() { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
+            // ttfx renders directly through its own terminal, bypassing Screen. Keep
+            // its overlay here so the FPS switch works for every catalog effect too.
+            fps_frames += 1;
+            let fps_elapsed = fps_since.elapsed().as_secs_f32();
+            if fps_elapsed >= 0.5 {
+                fps_value = fps_frames as f32 / fps_elapsed;
+                fps_frames = 0;
+                fps_since = std::time::Instant::now();
+            }
+            if show_fps {
+                if write!(out, "\x1b[{};1H\x1b[97mFPS {:.0}\x1b[0m", rows, fps_value).is_err() {
+                    let _ = ctx.terminal.restore_cursor(&mut out, "");
+                    return Ok(());
+                }
+                if out.flush().is_err() {
+                    let _ = ctx.terminal.restore_cursor(&mut out, "");
+                    return Ok(());
+                }
+            }
             // Live config poll (~every 45 frames): apply reactivity changes without a
-            // restart; on a structural change (effect picked / turned off) exit so the
-            // controller respawns us with the new effect.
+            // restart. Do not compare `live.effect` here: it is the user's selected
+            // effect, while the controller can temporarily render another enabled
+            // effect during rotation. That comparison killed every rotated ttfx child
+            // after 45 frames, leaving a blank/restarting background.
             frames += 1;
             if frames % 45 == 0 {
                 let live = read_config();
                 reactivity = live.reactivity;
-                if live.effect != effect_name || !live.running { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
+                if !live.running { let _ = ctx.terminal.restore_cursor(&mut out, ""); return Ok(()); }
             }
             // Pace by the live audio level, scaled by the user's reactivity setting.
             // Louder => smaller delay => faster animation, capped at 3x (triple).
             // reactivity 0 disables it; higher reactivity reaches the cap more easily.
             let vol = audio.volume().clamp(0.0, 1.0);
             let boost = vol * reactivity as f32 + if audio.beat() { 0.5 } else { 0.0 };
-            let speed = if audio_enabled && reactivity > 0 { (1.0 + boost).clamp(1.0, 3.0) } else { 1.0 };
-            let intended = Duration::from_secs_f64(frame_secs / speed as f64);
+            let audio_speed = if audio_enabled && reactivity > 0 { (1.0 + boost).clamp(1.0, 3.0) } else { 1.0 };
+            // Apply intensity as a live baseline speed control. It is sampled
+            // independently of reactivity, so moving this slider never resets
+            // a running ttfx scene.
+            let intensity_speed = 0.70 + live_intensity(intensity) as f32 * 0.06;
+            let base_speed = 0.50 + live_speed(speed) as f32 * 0.10;
+            let intended = Duration::from_secs_f64(frame_secs / (audio_speed * intensity_speed * base_speed) as f64);
             thread::sleep(intended);
             AUTO_DEGRADE.with(|a| a.borrow_mut().tick(intended.as_secs_f64() * 1000.0));
         }
         let _ = ctx.terminal.restore_cursor(&mut out, "");
         // Continuous background: loop all ttfx effects for the full rotate_secs
         // without a gap. The 400ms pause caused the visible "para y vuelve".
-        // Check if Service already switched effect/off while we were running.
+        // A selected effect is different from the controller's current rotation
+        // item, so only the running flag is safe to inspect here. The controller
+        // terminates and replaces this child for a real effect change.
         {
             let live = read_config();
-            if live.effect != effect_name || !live.running {
+            if !live.running {
                 let _ = ctx.terminal.restore_cursor(&mut out, "\n");
                 return Ok(());
             }
@@ -1693,8 +1834,8 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
     }
 }
 
-fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str, reactivity: i64, intro_beat_sync: bool) -> Result<()> {
-    log_dbg(&format!("run_render enter: effect={effect} {cols}x{rows} intensity={intensity} audio={audio} ttfx_text={ttfx_text} reactivity={reactivity} with_intro={with_intro} byline={byline} intro_beat_sync={intro_beat_sync}"));
+fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i64, speed: i64, audio: bool, byline: &str, intro_size: i64, cell_aspect: f32, show_fps: bool, with_intro: bool, ttfx_text: &str, reactivity: i64, intro_beat_sync: bool) -> Result<()> {
+    log_dbg(&format!("run_render enter: effect={effect} {cols}x{rows} intensity={intensity} speed={speed} audio={audio} ttfx_text={ttfx_text} reactivity={reactivity} with_intro={with_intro} byline={byline} intro_beat_sync={intro_beat_sync}"));
     let intensity = intensity.clamp(0, 10);
     let state = AudioState::start(audio);
     // Use the REAL PTY size, but WAIT for it to settle first (Vte spawns at 80x24).
@@ -1721,15 +1862,16 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
 
     set_auto_degrade_enabled(false);
     if with_intro {
-        show_intro(&mut scr, &palette, byline, effect, intro_size, &state, intro_beat_sync);
+        show_intro(&mut scr, &palette, byline, effect, intro_size, &state, intro_beat_sync, &cfg.boot_char_style);
     }
+
     // From here on, sustained FPS drops auto-escalate the grid resolution and
     // shrink the boot text (the intro replaying at the new size confirms it).
     set_auto_degrade_enabled(true);
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
-        run_ttfx(effect, cols, rows, ttfx_text, &state, audio, reactivity, cfg.use_theme_colors);
+        let _ = run_ttfx(effect, cols, rows, ttfx_text, &state, audio, intensity, speed, reactivity, cfg.use_theme_colors, &cfg.char_style, show_fps);
         return Ok(());
     }
 
@@ -1756,9 +1898,10 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
 }
 
 // Audio-reactive pacing: more sound => faster flow (lower delay), smoothly.
-fn frame_delay(base_ms: i64, intensity: i64, audio: &AudioState) -> Duration {
+fn frame_delay(base_ms: i64, intensity: i64, speed: i64, audio: &AudioState) -> Duration {
     let base = (base_ms - intensity * 3).clamp(8, 120) as f32;
-    let speed_up = 1.0 + audio.volume() * 2.5;
+    let speed_scale = 1.5 - speed.clamp(1, 10) as f32 * 0.10;
+    let speed_up = (1.0 + audio.volume() * 2.5) / speed_scale;
     Duration::from_millis((base / speed_up).max(6.0) as u64)
 }
 
@@ -1852,7 +1995,7 @@ fn fx_matrix(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Audio
                 }
             }
         }
-        let frame_dur = frame_delay(40, intensity, audio);
+        let frame_dur = frame_delay(40, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         thread::sleep(frame_dur);
@@ -1888,7 +2031,7 @@ fn fx_wave(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        let frame_dur = frame_delay(45, intensity, audio);
+        let frame_dur = frame_delay(45, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         t += 0.12 + lv * 0.25;
@@ -1928,7 +2071,7 @@ fn fx_bars(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        let frame_dur = frame_delay(50, intensity, audio);
+        let frame_dur = frame_delay(50, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         thread::sleep(frame_dur);
@@ -1989,7 +2132,7 @@ fn fx_donut(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioS
             }
             j += 0.07;
         }
-        let frame_dur = frame_delay(45, intensity, audio);
+        let frame_dur = frame_delay(45, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         let spin = 1.0 + lv * 2.0;
@@ -2018,7 +2161,7 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
             }
         }
         let lv = audio.volume();
-        let fuel = (28.0 + lv * 8.0 + intensity as f32 * 0.4) as u8;
+        let fuel = (28.0 + lv * 8.0 + live_intensity(intensity) as f32 * 0.4) as u8;
         for x in 0..cols { heat[rows - 1][x] = fuel.min(36); }
         for y in 0..rows - 1 {
             for x in 0..cols {
@@ -2038,7 +2181,7 @@ fn fx_fire(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        let frame_dur = frame_delay(45, intensity, audio);
+        let frame_dur = frame_delay(45, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         thread::sleep(frame_dur);
@@ -2069,7 +2212,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
         }
         scr.clear_dirty();
         let lv = audio.volume();
-        let speed = (0.006 + intensity as f32 * 0.0012) * (1.0 + lv * 2.2);
+        let speed = (0.006 + live_intensity(intensity) as f32 * 0.0012) * (1.0 + lv * 2.2);
         for s in stars.iter_mut() {
             s.2 -= speed;
             if s.2 <= 0.02 { *s = (rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 1.0); }
@@ -2081,7 +2224,7 @@ fn fx_starfield(scr: &mut Screen, palette: &[String], intensity: i64, audio: &Au
                 scr.put(px as usize, py as usize, ch, tint_to_color(tint, &cur_pal));
             }
         }
-        let frame_dur = frame_delay(40, intensity, audio);
+        let frame_dur = frame_delay(40, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         thread::sleep(frame_dur);
@@ -2122,7 +2265,7 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
                 }
             }
         }
-        let frame_dur = frame_delay(70, intensity, audio);
+        let frame_dur = frame_delay(70, live_intensity(intensity), live_speed(5), audio);
         scr.fps_overlay(frame_dur.as_secs_f64() * 1000.0);
         scr.present();
         let mut changed = 0u32;
@@ -2179,11 +2322,7 @@ mod selective_theme_tests {
         let theme = vec![("accent".to_string(), "#204080".to_string())];
         for effect in TTFX_EFFECTS {
             let transform = ttfx_theme_transform(effect, &theme);
-            if ["colorshift", "waves"].contains(&effect) {
-                assert!(transform.is_none(), "{effect} has ambiguous semantic/final RGB collisions");
-            } else {
-                assert!(transform.is_some(), "{effect} has no theme policy");
-            }
+            assert!(transform.is_some(), "{effect} has no theme policy");
         }
     }
 
@@ -2239,7 +2378,6 @@ mod selective_theme_tests {
         let warm = vec![("accent".to_string(), "#ff8040".to_string())];
         let cool = vec![("accent".to_string(), "#4080ff".to_string())];
         for effect in TTFX_EFFECTS {
-            if ["colorshift", "waves"].contains(&effect) { continue; }
             let sample = if effect == "burn" {
                 (0, 195, 255)
             } else {
@@ -2249,6 +2387,22 @@ mod selective_theme_tests {
             let b = ttfx_theme_transform(effect, &cool).unwrap()(sample.0, sample.1, sample.2);
             assert_ne!(a, b, "{effect} did not react to theme change for {sample:?}");
         }
+    }
+
+    #[test]
+    fn glyph_style_changes_only_the_ttfx_input_letters() {
+        let native = ttfx_canvas_input("A", 30, 15, "native");
+        let block = ttfx_canvas_input("A", 30, 15, "block");
+        let lower_o = ttfx_canvas_input("A", 30, 15, "lower_o");
+        let upper_o = ttfx_canvas_input("A", 30, 15, "upper_o");
+        assert!(native.contains('#'));
+        assert!(!native.contains('█'));
+        assert!(block.contains('█'));
+        assert!(!block.contains('#'));
+        assert!(lower_o.contains('o'));
+        assert!(!lower_o.contains('#'));
+        assert!(upper_o.contains('O'));
+        assert!(!upper_o.contains('#'));
     }
 
 }

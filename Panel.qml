@@ -37,6 +37,9 @@ Panel {
   property real panelOpacity: 0.6
   property point dragOffset: Qt.point(0, 0)
   property bool introBeatSync: true
+  property string charStyle: "native"
+  property string bootCharStyle: "native"
+  property int speed: 5
 
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
   // Vendored ttfx effects (rendered by the ttfx engine). matrix/rain stay hand-rolled
@@ -57,6 +60,10 @@ Panel {
   function refresh() { statusProc.running = true }
 
   function write(arg) { Quickshell.execDetached(["sh", root.writeState, arg]) }
+  // Coupled updates must use one writer process. Two detached read-modify-write
+  // calls race: selecting a disabled effect could enable it but restore the old
+  // active effect, making the first click appear to do nothing.
+  function writeMany(args) { Quickshell.execDetached(["sh", root.writeState].concat(args)) }
   function setRunning(v)   { root.running = v;   write("running="   + (v ? "1" : "0")); }
   function setAudio(v)     { root.audio = v;     write("audio="     + (v ? "1" : "0")); }
   function setShowFps(v)   { root.showFps = v;   write("show_fps="  + (v ? "1" : "0")); }
@@ -65,11 +72,18 @@ Panel {
   function setResolution(v) { root.resolution = v;  write("resolution=" + v); }
   function setReactivity(v) { root.reactivity = v;  write("reactivity=" + v); }
   function setTtfxText(t)  { root.ttfxText = t;    write("ttfx_text=" + t); }
-  function pickEffect(e)   { root.effect = e;    write("effect="    + e);
-    // Keep the picked effect in the rotation set so the rotation doesn't skip it.
-    if (root.effects.indexOf(e) < 0) { root.effects = root.effects.concat([e]); write("effect+" + e) }
+  function pickEffect(e)   { root.effect = e;
+    // Keep the picked effect in the rotation set and select it atomically. This
+    // prevents a detached effect+ write from overwriting the new selection.
+    if (root.effects.indexOf(e) < 0) {
+      root.effects = root.effects.concat([e])
+      writeMany(["effect=" + e, "effect+" + e])
+    } else {
+      write("effect=" + e)
+    }
   }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
+  function setSpeed(v) { root.speed = v; write("speed=" + v); }
   function setIntroSize(v) {
     root.introSize = v
     write("intro_size=" + v)
@@ -84,6 +98,27 @@ Panel {
   property bool transparentBackground: false
   function setUseThemeColors(v) { root.useThemeColors = v; write("use_theme_colors=" + (v ? "1" : "0")) }
   function setTransparentBackground(v) { root.transparentBackground = v; write("transparent_background=" + (v ? "1" : "0")) }
+  function setCharStyle(v) { root.charStyle = v; write("char_style=" + v) }
+  function bootCharGlyph() {
+    switch (root.bootCharStyle) {
+      case "block": return "█"
+      case "dark": return "▓"
+      case "medium": return "▒"
+      case "light": return "░"
+      case "hash": return "#"
+      case "dot": return "·"
+      case "lower_o": return "o"
+      case "upper_o": return "O"
+      default: return "#"
+    }
+  }
+  function cycleBootCharStyle() {
+    var styles = ["native", "block", "dark", "medium", "light", "hash", "dot", "lower_o", "upper_o"]
+    var index = styles.indexOf(root.bootCharStyle)
+    root.bootCharStyle = styles[(index + 1 + styles.length) % styles.length]
+    // This is a boot-only visual setting, so atomically replay the intro as a preview.
+    writeMany(["boot_char_style=" + root.bootCharStyle, "restart"])
+  }
   function toggleCollapsed() { root.collapsed = !root.collapsed; if (!root.collapsed) root.dragOffset = Qt.point(0,0) }
   // Cycle the active effect across the ENABLED set only (the user's selection).
   // Built-ins + ttfx combined catalog is for the grid UI, NOT for cycling.
@@ -102,12 +137,13 @@ Panel {
     if (!on && i >= 0) list.splice(i, 1)
     if (list.length === 0) return // never empty
     root.effects = list
-    write("effect" + (on ? "+" : "-") + e)
     // If the currently displayed effect was just disabled, switch to first enabled
     if (!on && root.effect === e) {
       var next = list[0]
       root.effect = next
-      write("effect=" + next)
+      writeMany(["effect-" + e, "effect=" + next])
+    } else {
+      write("effect" + (on ? "+" : "-") + e)
     }
   }
 
@@ -148,6 +184,7 @@ Panel {
             write("effect=" + root.effect)
           }
           if (typeof s.intensity === "number") root.intensity = s.intensity
+          if (typeof s.speed === "number") root.speed = Math.max(1, Math.min(10, s.speed))
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
           if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
           if (typeof s.rotate_secs === "number") root.rotateSecs = s.rotate_secs
@@ -159,6 +196,8 @@ Panel {
           if (typeof s.intro_beat_sync === "boolean") root.introBeatSync = s.intro_beat_sync
           if (typeof s.use_theme_colors === "boolean") root.useThemeColors = s.use_theme_colors
           if (typeof s.transparent_background === "boolean") root.transparentBackground = s.transparent_background
+          if (typeof s.char_style === "string") root.charStyle = s.char_style
+          if (typeof s.boot_char_style === "string") root.bootCharStyle = s.boot_char_style
         } catch (e) {}
       }
     }
@@ -182,9 +221,9 @@ Panel {
     centerOnBar: false  // anchor under the bar widget (like KeyboardPanel's default), not centered
     dragOffset: root.dragOffset
     contentWidth: root.collapsed ? panel.fittedContentWidth(Style.space(420)) : panel.fittedContentWidth(Style.space(560))
-    // Height must follow the content or the card stays short and the taller layout
-    // overflows below it (controls rendered on bare desktop with no card behind them).
-    contentHeight: root.collapsed ? panel.fittedContentHeight(collapsedRow.implicitHeight) : panel.fittedContentHeight(contentColumn.implicitHeight)
+    // Keep the card compact and put the long effect catalog in a real scroll view.
+    // The old content-sized card exceeded the screen and hid bottom settings.
+    contentHeight: root.collapsed ? panel.fittedContentHeight(collapsedRow.implicitHeight) : Math.round(panel.availableCardHeight * 0.86)
     focusTarget: keyCatcher
 
     // Translucent card so the animated background shows through. Opacity via slider.
@@ -204,11 +243,20 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(d) { if (root.bar) root.bar.switchPanelFrom(root.barIdentity, d) }
 
-      ColumnLayout {
-        id: contentColumn
-        width: parent.width
-        spacing: Style.space(12)
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        clip: true
+        contentWidth: width
+        contentHeight: contentColumn.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
         visible: !root.collapsed
+
+        ColumnLayout {
+          id: contentColumn
+          width: panelFlick.width
+          spacing: Style.space(12)
 
         RowLayout {
           Layout.fillWidth: true
@@ -289,6 +337,26 @@ Panel {
           }
         }
 
+        PanelSectionHeader {
+          visible: root.ttfxEffects.indexOf(root.effect) >= 0
+          text: "CARÁCTER · TEXTO TTFX"
+        }
+        RowLayout {
+          visible: root.ttfxEffects.indexOf(root.effect) >= 0
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Button { text: "Original"; selected: root.charStyle === "native"; onClicked: root.setCharStyle("native") }
+          Button { text: "█"; selected: root.charStyle === "block"; onClicked: root.setCharStyle("block") }
+          Button { text: "▓"; selected: root.charStyle === "dark"; onClicked: root.setCharStyle("dark") }
+          Button { text: "▒"; selected: root.charStyle === "medium"; onClicked: root.setCharStyle("medium") }
+          Button { text: "░"; selected: root.charStyle === "light"; onClicked: root.setCharStyle("light") }
+          Button { text: "#"; selected: root.charStyle === "hash"; onClicked: root.setCharStyle("hash") }
+          Button { text: "·"; selected: root.charStyle === "dot"; onClicked: root.setCharStyle("dot") }
+          Button { text: "o"; selected: root.charStyle === "lower_o"; onClicked: root.setCharStyle("lower_o") }
+          Button { text: "O"; selected: root.charStyle === "upper_o"; onClicked: root.setCharStyle("upper_o") }
+          Item { Layout.fillWidth: true }
+        }
+
         PanelSectionHeader { text: "TTFX EFFECTS" }
 
         // Vendored ttfx effects; same pick + rotation-toggle as the built-ins.
@@ -341,6 +409,10 @@ Panel {
             checked: root.bootBetween
             onToggled: root.setBootBetween(!root.bootBetween)
           }
+          Button {
+            text: "CHAR " + root.bootCharGlyph()
+            onClicked: root.cycleBootCharStyle()
+          }
         }
 
         // Sliders organized 3 per row for a compact layout
@@ -350,7 +422,7 @@ Panel {
           columnSpacing: Style.space(10)
           rowSpacing: Style.space(6)
 
-          // Row 1: Seconds | Intensity | Resolution
+          // Row 1: Seconds | Intensity | Speed
           ColumnLayout {
             Layout.fillWidth: true
             PanelSectionHeader { text: "SECONDS  ·  " + root.rotateSecs }
@@ -375,6 +447,19 @@ Panel {
           }
           ColumnLayout {
             Layout.fillWidth: true
+            PanelSectionHeader { text: "SPEED  ·  " + root.speed }
+            PanelSlider {
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 1; maximum: 10; step: 1; integer: true
+              value: root.speed
+              onMoved: function(v) { root.setSpeed(v) }
+            }
+          }
+
+          // Row 2: Resolution | Audio Reactivity | Intro Text Size
+          ColumnLayout {
+            Layout.fillWidth: true
             PanelSectionHeader { text: "RESOLUTION  ·  " + root.resolution }
             PanelSlider {
               Layout.fillWidth: true
@@ -385,14 +470,14 @@ Panel {
             }
           }
 
-          // Row 2: Audio Reactivity | Intro Text Size | (spacer)
+          // Row 2: Resolution | Audio Reactivity | Intro Text Size
           ColumnLayout {
             Layout.fillWidth: true
             PanelSectionHeader { text: "AUDIO REACT  ·  " + root.reactivity }
             PanelSlider {
               Layout.fillWidth: true
               bar: root.bar
-              minimum: 0; maximum: 3; step: 1; integer: true
+              minimum: 0; maximum: 5; step: 1; integer: true
               value: root.reactivity
               onMoved: function(v) { root.setReactivity(v) }
             }
@@ -408,7 +493,6 @@ Panel {
               onMoved: function(v) { root.setIntroSize(v) }
             }
           }
-          Item { Layout.fillWidth: true } // spacer for the 3rd column
         }
 
         PanelSectionHeader { text: "INTRO BYLINE" }
@@ -451,6 +535,24 @@ Panel {
           value: Math.round(root.panelOpacity*100)
           onMoved: function(v) { root.setPanelOpacity(v/100) }
         }
+        }
+      }
+
+      // The catalog is intentionally longer than the card. Keep a permanent
+      // thumb visible while it overflows so scrolling is discoverable.
+      Rectangle {
+        id: scrollThumb
+        visible: !root.collapsed && panelFlick.contentHeight > panelFlick.height + 1
+        z: 2
+        width: Style.space(3)
+        height: Math.max(Style.space(18), panelFlick.height * panelFlick.height / panelFlick.contentHeight)
+        x: parent.width - width
+        y: panelFlick.y + panelFlick.contentY * (panelFlick.height - height) /
+           Math.max(1, panelFlick.contentHeight - panelFlick.height)
+        radius: width / 2
+        color: Color.accent
+        opacity: 0.75
+        Behavior on y { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
       }
 
       RowLayout {
