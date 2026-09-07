@@ -1636,6 +1636,11 @@ fn final_accent_set(effect: &str) -> std::collections::HashSet<ThemeRgb> {
 }
 
 fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option<ttfx::utils::ansi::ColorTransform> {
+    // A missing theme file is not a theme. Leaving the transform disabled keeps
+    // TTFX's built-in palette intact instead of applying fallback accent colors.
+    if theme.is_empty() {
+        return None;
+    }
     let map = theme_palette_mapper(theme);
     match effect_name {
         // These were deliberately left unthemed when the initial catalog landed,
@@ -2323,6 +2328,16 @@ mod selective_theme_tests {
         for effect in TTFX_EFFECTS {
             let transform = ttfx_theme_transform(effect, &theme);
             assert!(transform.is_some(), "{effect} has no theme policy");
+        }
+    }
+
+    #[test]
+    fn missing_theme_configuration_keeps_every_ttfx_effect_native() {
+        for effect in TTFX_EFFECTS {
+            assert!(
+                ttfx_theme_transform(effect, &[]).is_none(),
+                "{effect} should retain its built-in palette without theme colors"
+            );
         }
     }
 
