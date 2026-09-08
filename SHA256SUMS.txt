@@ -1,5 +1,5 @@
 # SHA-256 of the bundled prebuilt executables.
-# Canonical builds on Arch Linux at /tmp/oab-build/src with
-# CARGO_HOME=/tmp/oab-build/cargo and rustc 1.98.0. See REPRODUCING.md.
-60862dacf7b31f904c6319df4a57aa9f62d9b3d88672eb4cefe2ab42761b9bbe  bin/ttfx-bg-rs-aarch64
-ec88b212b2d5d50b120cc467e2482d31b375d3af5e79817d837e77406c526511  bin/ttfx-bg-rs-x86_64
+# Native Arch Linux builds with rustc 1.98.0. See REPRODUCING.md
+# for source, build locations, and verification limits.
+3ce47f59038757060677626aef0803cc2345462b33ab5463935699e34593da64  bin/ttfx-bg-rs-aarch64
+7204d25ca64eaa058eac6357a351dc0d0e8ce33edda76f6ac6bdd1fe18f34ee1  bin/ttfx-bg-rs-x86_64

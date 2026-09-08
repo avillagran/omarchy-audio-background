@@ -39,6 +39,7 @@ Panel {
   property bool introBeatSync: true
   property string charStyle: "native"
   property string bootCharStyle: "native"
+  // State uses fifths of normal speed: 5 = 1x, 100 = 20x.
   property int speed: 5
 
   readonly property var allEffects: ["matrix", "rain", "wave", "bars", "donut", "fire", "starfield", "life"]
@@ -83,7 +84,7 @@ Panel {
     }
   }
   function setIntensity(v) { root.intensity = v; write("intensity=" + v); }
-  function setSpeed(v) { root.speed = v; write("speed=" + v); }
+  function setSpeed(v) { root.speed = Math.max(1, Math.min(100, Math.round(v))); write("speed=" + root.speed); }
   function setIntroSize(v) {
     root.introSize = v
     write("intro_size=" + v)
@@ -184,7 +185,7 @@ Panel {
             write("effect=" + root.effect)
           }
           if (typeof s.intensity === "number") root.intensity = s.intensity
-          if (typeof s.speed === "number") root.speed = Math.max(1, Math.min(10, s.speed))
+          if (typeof s.speed === "number") root.speed = Math.max(1, Math.min(100, s.speed))
           if (typeof s.intro_size === "number") root.introSize = s.intro_size
           if (typeof s.boot_between === "boolean") root.bootBetween = s.boot_between
           if (typeof s.rotate_secs === "number") root.rotateSecs = s.rotate_secs
@@ -447,11 +448,11 @@ Panel {
           }
           ColumnLayout {
             Layout.fillWidth: true
-            PanelSectionHeader { text: "SPEED  ·  " + root.speed }
+            PanelSectionHeader { text: "SPEED  ·  " + (root.speed / 5).toFixed(1) + "x" }
             PanelSlider {
               Layout.fillWidth: true
               bar: root.bar
-              minimum: 1; maximum: 10; step: 1; integer: true
+              minimum: 1; maximum: 100; step: 1; integer: true
               value: root.speed
               onMoved: function(v) { root.setSpeed(v) }
             }

@@ -7,6 +7,7 @@
 #   write_state.sh effect+fire          (enable effect in the rotation list)
 #   write_state.sh effect-fire          (disable it)
 #   write_state.sh intensity=0..10
+#   write_state.sh speed=1..100        (fifths of normal speed: 5=1x, 100=20x)
 #   write_state.sh intro_size=1..3      (intro title ASCII-art scale, default 2)
 #   write_state.sh show_fps=1|0         (FPS counter overlay)
 #   write_state.sh boot_between=1|0     (show boot splash when rotating backgrounds)
@@ -35,7 +36,7 @@ if [ -f "$STATE" ]; then
   v=$(grep -o '"boot_between"[^,}]*' "$STATE" || true); [ -n "$v" ] && boot_between=$(echo "$v" | grep -o '\(true\|false\)')
   v=$(grep -o '"effect"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATE" || true); [ -n "$v" ] && effect=$(echo "$v" | sed 's/.*"effect"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
   v=$(grep -o '"intensity"[^,}]*' "$STATE" || true); [ -n "$v" ] && intensity=$(echo "$v" | grep -o '[0-9]\+')
-  v=$(grep -o '"speed"[^,}]*' "$STATE" || true); [ -n "$v" ] && speed=$(echo "$v" | grep -o '[0-9]\+')
+  v=$(grep -o '"speed"[^,}]*' "$STATE" || true); [ -n "$v" ] && speed=$(echo "$v" | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//')
   v=$(grep -o '"restart"[^,}]*' "$STATE" || true);   [ -n "$v" ] && restart=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"intro_size"[^,}]*' "$STATE" || true); [ -n "$v" ] && intro_size=$(echo "$v" | grep -o '[0-9]\+')
   v=$(grep -o '"rotate_secs"[^,}]*' "$STATE" || true); [ -n "$v" ] && rotate_secs=$(echo "$v" | grep -o '[0-9]\+')
@@ -89,6 +90,20 @@ case "$arg" in
     effects=$(echo " $effects " | sed "s/ $name / /" | xargs) ;;
 esac
 done
+
+# Bound the persisted speed too, including when preserving an existing value.
+# Strip leading zeros before arithmetic and avoid overflow on oversized input.
+case "$speed" in
+  -*) speed=1 ;;
+  ''|*[!0-9]*) speed=5 ;;
+  *)
+    speed=$(printf '%s' "$speed" | sed 's/^0*//')
+    case "$speed" in
+      '') speed=1 ;;
+      ?|??) : ;;
+      *) speed=100 ;;
+    esac ;;
+esac
 
 # never let the effects list go empty
 [ -z "$effects" ] && effects="$effect"

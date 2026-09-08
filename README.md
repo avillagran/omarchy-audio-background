@@ -34,6 +34,27 @@ Plus a vendored catalog from [`ttfx`](https://github.com/omacom/ttfx): `beams`, 
 
 Enable any subset in the panel; with more than one enabled the active effect rotates every 20 s.
 
+### TTFX text gradient
+
+When the input is `OMARCHY` (case-insensitive), the renderer uses the official
+81×19 Omarchy wordmark bitmap, preserving its exact pixel silhouette rather
+than approximating it with a generic font. The bitmap comes from Omarchy's
+`logo.svg`; terminal-cell aspect compensation preserves its proportions.
+Other input uses ordinary text characters, preserving case and punctuation.
+The character-style selector changes only the wordmark's filled pixels.
+
+All 35 TTFX effects use five solid horizontal bands for their final text gradient
+by default. From top to bottom, the band heights follow **4:3:4:3:5** character
+rows: exactly 4, 3, 4, 3, and 5 rows for text that is 19 rows high. Other text
+heights scale these proportions to the text bounds, rounding cumulative
+boundaries to the nearest row. Canvas margins are not part of the gradient.
+
+The five colors are sampled from each effect's own gradient in palette order;
+no fixed replacement palette is imposed. Live theme and audio color transforms
+still apply. This layout changes the assembled text, not transient fire,
+lightning, particles, or the native Matrix/Rain and other built-in effects.
+Standalone `ttfx` keeps its original gradient defaults.
+
 ## Configuration
 
 Key settings in the panel:
@@ -43,6 +64,7 @@ Key settings in the panel:
 - **Use theme colors** — pick the palette from the active Omarchy theme instead of the built-in effect colors (default on).
 - **Effect** — choose and enable/disable individual effects.
 - **Intensity** — 0–10, animation speed and trail length.
+- **Speed** — 0.2×–20×, adjusted live; the default remains 1×.
 - **Audio reactivity** — how strongly audio affects speed/brightness/color.
 - **Resolution** — render at lower or higher cell density.
 - **Intro text** — word shown during the boot splash (default `OMARCHY`).

@@ -15,6 +15,8 @@
 //   - Step 1: vendor ttfx's effect engine as a lib and call it here instead.
 //   - Step 2: (done here) audio level from parec modulates flow speed/density.
 
+mod wordmark;
+
 use anyhow::Result;
 use gtk4::gdk;
 use gtk4::prelude::*;
@@ -124,9 +126,9 @@ impl SpeedWatcher {
     fn current(&mut self, fallback: i64) -> i64 {
         if self.last_check.elapsed() >= Duration::from_millis(250) {
             self.last_check = std::time::Instant::now();
-            self.speed = read_config().speed.clamp(1, 10);
+            self.speed = read_config().speed.clamp(1, 100);
         }
-        if self.speed == -1 { fallback.clamp(1, 10) } else { self.speed }
+        if self.speed == -1 { fallback.clamp(1, 100) } else { self.speed }
     }
 }
 
@@ -139,6 +141,17 @@ thread_local! {
 
 fn live_speed(fallback: i64) -> i64 {
     SPEED_WATCHER.with(|watcher| watcher.borrow_mut().current(fallback))
+}
+
+// Stored in fifths of normal speed: existing default 5 = 1x, 100 = 20x.
+// Both backends divide their ordinary (intensity/audio-adjusted) delay by this
+// multiplier. Apply after native minimum-delay clamping so it cannot cap SPEED.
+fn speed_multiplier(speed: i64) -> f64 {
+    speed.clamp(1, 100) as f64 / 5.0
+}
+
+fn speed_delay(baseline: Duration, speed: i64) -> Duration {
+    baseline.div_f64(speed_multiplier(speed))
 }
 
 // --- Auto-degrade: detect sustained FPS drops and coarsen the grid -------------
@@ -411,7 +424,7 @@ fn read_config() -> Config {
     if let Some(v) = json_str(&text, "effect") { cfg.effect = v; }
     if let Some(v) = json_str(&text, "byline") { cfg.byline = v; }
     if let Some(v) = json_num(&text, "intensity") { cfg.intensity = v; }
-    if let Some(v) = json_num(&text, "speed") { cfg.speed = v.clamp(1, 10); }
+    if let Some(v) = json_num(&text, "speed") { cfg.speed = v.clamp(1, 100); }
     if let Some(v) = json_num(&text, "restart") { cfg.restart = v; }
     if let Some(v) = json_num(&text, "intro_size") { cfg.intro_size = v; }
     if let Some(v) = json_bool(&text, "show_fps") { cfg.show_fps = v; }
@@ -661,7 +674,7 @@ fn main() -> Result<()> {
         let cols = arg_value(&args, "--cols").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
         let rows = arg_value(&args, "--rows").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
         let intensity = arg_value(&args, "--intensity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5);
-        let speed = arg_value(&args, "--speed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5).clamp(1, 10);
+        let speed = arg_value(&args, "--speed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(5).clamp(1, 100);
         let audio = arg_value(&args, "--audio").map(|s| s == "1").unwrap_or(false);
         let byline = arg_value(&args, "--byline").unwrap_or_default();
         let ttfx_text = arg_value(&args, "--ttfx-text").unwrap_or_else(|| "OMARCHY".into());
@@ -684,7 +697,7 @@ fn main() -> Result<()> {
         let reactivity = arg_value(&args, "--reactivity").and_then(|s| s.parse::<i64>().ok()).unwrap_or(2);
         let state = AudioState::start(false); // standalone --ttfx: no audio capture
         let show_fps = arg_value(&args, "--show-fps").map(|s| s == "1").unwrap_or(false);
-        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, 5, 5, reactivity, false, "native", show_fps);
+        return run_ttfx(&effect, cols, rows, &ttfx_text, &state, false, 5, 5, reactivity, false, "native", show_fps, 2.0);
     }
 
     arm_parent_death_signal();
@@ -1548,31 +1561,10 @@ fn is_valid_effect(name: &str) -> bool { DEFAULT_EFFECTS.contains(&name) || is_t
 // Drive a vendored ttfx effect on our Vte PTY, looping so it runs as a continuous
 // background (ttfx effects settle when done; rebuild and replay). Handles PTY resize
 // by rebuilding at the new size. Runs after our ASCII intro (same stdout).
-// Canvas input for ttfx effects: the configured text rendered as centered ASCII art —
-// big enough that the effect animates a real readable word (ttfx effects animate
-// text, so they need real content, not sparse noise).
+// The official wordmark is a bitmap; every other input remains ordinary text.
+#[cfg(test)]
 fn ttfx_canvas_input(text: &str, cols: usize, rows: usize, char_style: &str) -> String {
-    let t = prep(text);
-    let n = t.chars().count().max(1);
-    // Scale to fill ~70% of the width, capped by ~60% of the height.
-    let ws = ((cols as f64 * 0.7) / (6.0 * n as f64)) as usize;
-    let hs = ((rows as f64 * 0.6) / 5.0) as usize;
-    let scale = ws.min(hs).clamp(1, 40);
-    let gap = scale.max(1);
-    let art = art_prefix(&t, n, scale, gap);
-    let art_h = 5 * scale;
-    let art_w = art_width(&t, scale, gap);
-    let top = rows.saturating_sub(art_h) / 2;
-    let left = cols.saturating_sub(art_w) / 2;
-    let mut canvas = vec![vec![' '; cols]; rows];
-    for (r, line) in art.iter().enumerate() {
-        for (i, ch) in line.chars().enumerate() {
-            if ch != ' ' && top + r < rows && left + i < cols {
-                canvas[top + r][left + i] = styled_glyph(char_style, ch);
-            }
-        }
-    }
-    canvas.iter().map(|row| row.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    wordmark::canvas_input(text, cols, rows, char_style, 2.0)
 }
 
 type ThemeRgb = (u8, u8, u8);
@@ -1677,7 +1669,7 @@ fn ttfx_theme_transform(effect_name: &str, theme: &[(String, String)]) -> Option
 // advances the effect faster, quiet slows it — so the whole ttfx catalog reacts to
 // the music like the hand-rolled effects do. Loops so it runs as a continuous
 // background; rebuilds on PTY resize. Runs after our ASCII intro (same stdout).
-fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, intensity: i64, speed: i64, reactivity: i64, use_theme_colors: bool, char_style: &str, show_fps: bool) -> Result<()> {
+fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio: &AudioState, audio_enabled: bool, intensity: i64, speed: i64, reactivity: i64, use_theme_colors: bool, char_style: &str, show_fps: bool, cell_aspect: f32) -> Result<()> {
     log_dbg(&format!("run_ttfx enter: effect={effect_name} {cols}x{rows} ttfx_text={ttfx_text} reactivity={reactivity} audio_enabled={audio_enabled}"));
     use clap::Parser;
     use std::io::Write;
@@ -1703,8 +1695,8 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             Ok(ttfx::cli::Cli { effect: Some(e), .. }) => e.build_effect(),
             _ => { let m = format!("unknown ttfx effect: {effect_name}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
         };
-        // Canvas = the configured text as centered ASCII art (rebuilt each pass).
-        let input = ttfx_canvas_input(ttfx_text, cols, rows, char_style);
+        // Match the official pixel proportions to the actual terminal cells.
+        let input = wordmark::canvas_input(ttfx_text, cols, rows, char_style, cell_aspect);
         let mut config = TerminalConfig::default();
         config.canvas_width = cols as i64;
         config.canvas_height = rows as i64;
@@ -1713,6 +1705,7 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             Ok(c) => c,
             Err(e) => { let m = format!("ttfx ctx error for {effect_name}: {e:?}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
         };
+        ctx.final_text_bands = true;
         if let Err(e) = effect.build(&mut ctx) { let m = format!("ttfx build error for {effect_name}: {e:?}"); eprintln!("{m}"); log_dbg(&m); return Ok(()); }
 
         // Audio-paced frame loop: with a virtual clock each next_frame() advances the
@@ -1815,8 +1808,8 @@ fn run_ttfx(effect_name: &str, cols: usize, rows: usize, ttfx_text: &str, audio:
             // independently of reactivity, so moving this slider never resets
             // a running ttfx scene.
             let intensity_speed = 0.70 + live_intensity(intensity) as f32 * 0.06;
-            let base_speed = 0.50 + live_speed(speed) as f32 * 0.10;
-            let intended = Duration::from_secs_f64(frame_secs / (audio_speed * intensity_speed * base_speed) as f64);
+            let baseline = Duration::from_secs_f64(frame_secs / (audio_speed * intensity_speed) as f64);
+            let intended = speed_delay(baseline, live_speed(speed));
             thread::sleep(intended);
             AUTO_DEGRADE.with(|a| a.borrow_mut().tick(intended.as_secs_f64() * 1000.0));
         }
@@ -1876,7 +1869,7 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
 
     // ttfx effects drive the vendored engine on this same PTY (after our intro).
     if is_ttfx_effect(effect) {
-        let _ = run_ttfx(effect, cols, rows, ttfx_text, &state, audio, intensity, speed, reactivity, cfg.use_theme_colors, &cfg.char_style, show_fps);
+        let _ = run_ttfx(effect, cols, rows, ttfx_text, &state, audio, intensity, speed, reactivity, cfg.use_theme_colors, &cfg.char_style, show_fps, cell_aspect);
         return Ok(());
     }
 
@@ -1905,9 +1898,9 @@ fn run_render(cfg: &Config, effect: &str, cols: usize, rows: usize, intensity: i
 // Audio-reactive pacing: more sound => faster flow (lower delay), smoothly.
 fn frame_delay(base_ms: i64, intensity: i64, speed: i64, audio: &AudioState) -> Duration {
     let base = (base_ms - intensity * 3).clamp(8, 120) as f32;
-    let speed_scale = 1.5 - speed.clamp(1, 10) as f32 * 0.10;
-    let speed_up = (1.0 + audio.volume() * 2.5) / speed_scale;
-    Duration::from_millis((base / speed_up).max(6.0) as u64)
+    let audio_speed = 1.0 + audio.volume() * 2.5;
+    let baseline = Duration::from_millis((base / audio_speed).max(6.0) as u64);
+    speed_delay(baseline, speed)
 }
 
 // --- matrix / rain: column rain where EACH COLUMN follows its frequency band
@@ -2303,6 +2296,63 @@ fn fx_life(scr: &mut Screen, palette: &[String], intensity: i64, audio: &AudioSt
 }
 
 #[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    #[test]
+    fn speed_panel_displays_multiplier_and_reaches_twenty() {
+        let panel = include_str!("../../../Panel.qml");
+        assert!(panel.contains("(root.speed / 5).toFixed(1) + \"x\""));
+        assert!(panel.contains("minimum: 1; maximum: 100; step: 1; integer: true"));
+        assert!(panel.contains("Math.min(100, s.speed)"));
+    }
+
+    #[test]
+    fn speed_writer_round_trips_and_bounds_values() {
+        let home = std::env::temp_dir().join(format!("ttfx-speed-test-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&home).unwrap();
+        let state = home.join(".local/state/omarchy/audio-background/state.json");
+        let write = |args: &[&str]| {
+            let result = std::process::Command::new("sh")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../write_state.sh"))
+                .args(args).env("HOME", &home).output().unwrap();
+            assert!(result.status.success(), "{:?}", result);
+            std::fs::read_to_string(&state).unwrap()
+        };
+        assert_eq!(json_num(&write(&[]), "speed"), Some(5));
+        for (input, expected) in [("1", 1), ("5", 5), ("20", 20), ("100", 100), ("101", 100), ("999999999999999999999", 100), ("0", 1), ("-1", 1), ("oops", 5)] {
+            let text = write(&[&format!("speed={input}"), "effect=rain"]);
+            assert_eq!(json_num(&text, "speed"), Some(expected), "input={input}");
+            assert_eq!(json_str(&text, "effect").as_deref(), Some("rain"));
+        }
+        write(&["speed=100"]);
+        assert_eq!(json_num(&write(&["audio=0"]), "speed"), Some(100));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn speed_pacing_is_shared_and_clamped_without_a_six_ms_ceiling() {
+        let audio = AudioState::start(false);
+        for value in [1, 5, 20, 100] {
+            let expected = Duration::from_millis(8).div_f64(value as f64 / 5.0);
+            assert_eq!(speed_delay(Duration::from_millis(8), value), expected);
+            assert_eq!(frame_delay(8, 0, value, &audio), expected);
+        }
+        assert_eq!(speed_multiplier(i64::MIN), 0.2);
+        assert_eq!(speed_multiplier(i64::MAX), 20.0);
+    }
+
+    #[test]
+    fn speed_default_is_unchanged_and_max_is_twenty_times_faster() {
+        let audio = AudioState::start(false);
+        assert_eq!(Config::default().speed, 5);
+        let baseline = frame_delay(40, 5, 5, &audio);
+        assert_eq!(baseline, Duration::from_millis(25));
+        assert_eq!(frame_delay(40, 5, 100, &audio), baseline.div_f64(20.0));
+    }
+}
+
+#[cfg(test)]
 mod selective_theme_tests {
     use super::*;
     use ttfx::utils::graphics::{Color, Gradient};
@@ -2406,12 +2456,12 @@ mod selective_theme_tests {
 
     #[test]
     fn glyph_style_changes_only_the_ttfx_input_letters() {
-        let native = ttfx_canvas_input("A", 30, 15, "native");
-        let block = ttfx_canvas_input("A", 30, 15, "block");
-        let lower_o = ttfx_canvas_input("A", 30, 15, "lower_o");
-        let upper_o = ttfx_canvas_input("A", 30, 15, "upper_o");
-        assert!(native.contains('#'));
-        assert!(!native.contains('█'));
+        let native = ttfx_canvas_input("OMARCHY", 200, 64, "native");
+        let block = ttfx_canvas_input("OMARCHY", 200, 64, "block");
+        let lower_o = ttfx_canvas_input("OMARCHY", 200, 64, "lower_o");
+        let upper_o = ttfx_canvas_input("OMARCHY", 200, 64, "upper_o");
+        assert!(!native.contains('#'));
+        assert!(native.contains('█'));
         assert!(block.contains('█'));
         assert!(!block.contains('#'));
         assert!(lower_o.contains('o'));
