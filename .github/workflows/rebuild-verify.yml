@@ -1,0 +1,96 @@
+name: rebuild-verify
+
+# Reproducible-provenance gate for the bundled prebuilt executables.
+#
+# Rebuilds the x86_64 binary from the exact committed source (including the
+# ttfx-src git submodule and both Cargo.lock files) inside a pinned Arch
+# environment and compares the result against the hash recorded in
+# SHA256SUMS.txt. The environment pins are:
+#
+#   - container image: archlinux@sha256:204e91... (multi-entry manifest, see env)
+#   - package snapshot: https://archive.archlinux.org/repos/2026/09/15
+#   - toolchain: rustup 1.98.0
+#
+# Run "bootstrap" mode to produce a fresh canonical binary (uploaded as an
+# artifact) without failing on hash mismatch — used when intentionally
+# refreshing the shipped executables.
+
+on:
+  push:
+    paths:
+      - 'bin/ttfx-bg-rs-x86_64'
+      - 'bin/ttfx-bg-rs-aarch64'
+      - 'SHA256SUMS.txt'
+      - 'scripts/repro-build.sh'
+      - 'bin/ttfx-bg-rs/**'
+      - 'ttfx-src'
+      - 'build-manifest-aarch64.txt'
+      - '.github/workflows/rebuild-verify.yml'
+      - '.github/workflows/check-binary-hashes.yml'
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Build in the pinned environment and upload the result without comparing hashes
+        type: boolean
+        default: false
+
+env:
+  ARCH_IMAGE: archlinux@sha256:204e91950fd364961088a01773eee9012243b7e965fed42b1d82d12416190782
+  REPO_SNAPSHOT: https://archive.archlinux.org/repos/2026/09/15
+
+jobs:
+  rebuild-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Rebuild in pinned Arch environment
+        run: |
+          docker run --rm \
+            -e REPO_SNAPSHOT="$REPO_SNAPSHOT" \
+            -v "$GITHUB_WORKSPACE:/oab/build" -w /oab/build \
+            "$ARCH_IMAGE" bash -euo pipefail -c '
+              echo "Server = $REPO_SNAPSHOT/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist
+              pacman -Syy --noconfirm
+              pacman -S --needed --noconfirm base-devel rustup gtk4 gtk4-layer-shell vte4 pkgconf
+              rustup default 1.98.0
+              scripts/repro-build.sh
+              mkdir -p /oab/build/.ci-manifest
+              pacman -Q > /oab/build/.ci-manifest/build-manifest-x86_64.txt
+            '
+
+      - name: Upload rebuilt binary and build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttfx-bg-rs-x86_64-rebuilt
+          path: |
+            bin/ttfx-bg-rs/target/release/ttfx-bg-rs
+            .ci-manifest/build-manifest-x86_64.txt
+
+      - name: Compare against recorded hash
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.bootstrap == false }}
+        run: |
+          expected=$(awk '/ttfx-bg-rs-x86_64$/ {print $1}' SHA256SUMS.txt)
+          actual=$(sha256sum bin/ttfx-bg-rs/target/release/ttfx-bg-rs | awk '{print $1}')
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          test -n "$expected" && test "$expected" = "$actual"
+
+      - name: Clean root-owned build tree
+        if: always()
+        run: sudo rm -rf bin/ttfx-bg-rs/target
+
+  bind-aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify recorded hash and manifest binding
+        run: |
+          grep ttfx-bg-rs-aarch64 SHA256SUMS.txt | sha256sum -c -
+          test -s build-manifest-aarch64.txt
+          grep -q "^# ttfx-src submodule" build-manifest-aarch64.txt
