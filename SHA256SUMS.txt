@@ -1,5 +1,5 @@
 # SHA-256 of the bundled prebuilt executables.
 # Native Arch Linux builds with rustc 1.98.0. See REPRODUCING.md
 # for source, build locations, and verification limits.
-3ce47f59038757060677626aef0803cc2345462b33ab5463935699e34593da64  bin/ttfx-bg-rs-aarch64
+e9b349d189dc811ddbe927d648b964b717d0917159e572e561fa0a0302ed4c17  bin/ttfx-bg-rs-aarch64
 7204d25ca64eaa058eac6357a351dc0d0e8ce33edda76f6ac6bdd1fe18f34ee1  bin/ttfx-bg-rs-x86_64
