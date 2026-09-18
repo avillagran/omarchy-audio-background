@@ -2,4 +2,4 @@
 # Native Arch Linux builds with rustc 1.98.0. See REPRODUCING.md
 # for source, build locations, and verification limits.
 e9b349d189dc811ddbe927d648b964b717d0917159e572e561fa0a0302ed4c17  bin/ttfx-bg-rs-aarch64
-7204d25ca64eaa058eac6357a351dc0d0e8ce33edda76f6ac6bdd1fe18f34ee1  bin/ttfx-bg-rs-x86_64
+1b51342ca73ad9752f7ca230bcf34e065e51375fbdaff2d970c65a4ac6585b37  bin/ttfx-bg-rs-x86_64
