@@ -1097,7 +1097,9 @@ fn goertzel(samples: &[f32], rate: f32, freq: f32) -> f32 {
     s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2
 }
 
-// Capture the default sink monitor via parec and keep per-band energies.
+// Capture PulseAudio's default monitor directly and keep per-band energies.
+// Resolving it with `pactl get-default-sink` can block forever while PipeWire
+// is unavailable, leaving the renderer with an unjoinable capture thread.
 // Log-spaced bands 60Hz..10kHz, rolling-peak auto-normalization (quiet audio
 // still moves), fast-attack/slow-decay per band so it follows without jitter.
 fn audio_capture_loop(st: AudioState) {
@@ -1105,21 +1107,10 @@ fn audio_capture_loop(st: AudioState) {
         .map(|i| 60.0 * (10000.0f32 / 60.0).powf(i as f32 / (NBANDS - 1) as f32))
         .collect();
     loop {
-        let sink = std::process::Command::new("pactl")
-            .args(["get-default-sink"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-        let sink = match sink {
-            Some(s) if !s.is_empty() => s,
-            _ => { thread::sleep(Duration::from_secs(2)); continue; }
-        };
-        let monitor = format!("{sink}.monitor");
         let child = std::process::Command::new("parec")
-            .args(["--device", &monitor, "--format=s16le",
-                   "--rate", &format!("{}", SAMPLE_RATE as u32),
-                   "--channels=1", "--latency-msec=40"])
+            .args(["--device=@DEFAULT_MONITOR@", "--format=s16le",
+                    "--rate", &format!("{}", SAMPLE_RATE as u32),
+                    "--channels=1", "--latency-msec=40"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn();
